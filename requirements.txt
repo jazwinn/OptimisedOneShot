@@ -1,0 +1,73 @@
+# OptimisedOneShot — Python Dependencies
+# ========================================
+# Install with:  pip install -r requirements.txt
+#
+# GPU / CUDA:
+#   This application requires an NVIDIA GPU with CUDA 11.8+.
+#   PyTorch must be installed with a matching CUDA version.
+#   Visit https://pytorch.org/get-started/ for the correct pip index URL.
+#   Example (CUDA 12.x):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# Model weights (download separately — not pip-installable):
+#   SAM2 Large   : sam2.1_hiera_large.pt  (Meta SAM2 GitHub releases)
+#   FastSAM-s    : FastSAM-s.pt           (auto-downloaded by Ultralytics on first run)
+#   OSNet x0.25  : osnet_x0_25_imagenet.pth (deep-person-reid GitHub releases, optional)
+
+# ── Core deep learning ────────────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ── GUI ──────────────────────────────────────────────────────────────
+qtpy>=2.4.0
+PyQt5>=5.15.9
+# Alternative: PySide6>=6.6.0 (set QT_API=pyside6 environment variable)
+
+# ── Segmentation models ───────────────────────────────────────────────
+# SAM2 (segment-anything-2) — install from Meta's GitHub:
+#   pip install git+https://github.com/facebookresearch/segment-anything-2.git
+# Or if published to PyPI under 'SAM-2':
+#   pip install SAM-2>=1.0
+#
+# FastSAM is provided by Ultralytics:
+ultralytics>=8.0.0
+
+# ── Computer vision & media ────────────────────────────────────────────
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# ── Video encoding ────────────────────────────────────────────────────
+# ffmpeg-python provides the Python wrapper; the system ffmpeg binary
+# must also be installed and on PATH (https://ffmpeg.org/download.html).
+ffmpeg-python>=0.2.0
+
+# ── Optional: GPU-accelerated video decode ─────────────────────────────
+# Uncomment ONE of the following if you want hardware NVDEC decode:
+#
+# decord (NVDEC via CUDA):
+#   pip install decord
+#   Windows wheel: https://github.com/dmlc/decord/releases
+#
+# torchaudio (NVDEC via StreamReader):
+#   pip install torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# Without these, the application falls back to cv2.CAP_MSMF on Windows
+# (hardware-accelerated via DXVA2) or cv2.CAP_FFMPEG (CPU) — both fully
+# functional, only a few percent slower than NVDEC for typical resolutions.
+
+# ── Optional: OSNet Re-ID (higher identity discrimination) ─────────────
+# torchreid installs OSNet-x0.25.  Without it, ResNet18 (512-d ImageNet
+# features) is used as an automatic fallback.
+#
+# Install from source (PyPI package may be outdated):
+#   pip install git+https://github.com/KaiyangZhou/deep-person-reid.git
+# Or:
+#   pip install torchreid
+
+# ── SAM2 dependencies (installed automatically with SAM2) ──────────────
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+
+# ── Utilities ─────────────────────────────────────────────────────────
+scipy>=1.11.0
