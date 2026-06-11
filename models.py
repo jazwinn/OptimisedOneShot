@@ -41,6 +41,23 @@ logger = logging.getLogger(__name__)
 # VRAM threshold (GB free) below which the heavy model is evicted.
 VRAM_SWAP_THRESHOLD_GB: float = 8.0
 
+
+def _triton_available() -> bool:
+    """Return True only if the Triton compiler is installed (required by torch.compile on CUDA)."""
+    try:
+        import triton  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+# Auto-download URLs for SAM2.1 checkpoints (Meta CDN).
+SAM2_CHECKPOINT_URLS: dict[str, str] = {
+    "sam2.1_hiera_large.pt":     "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
+    "sam2.1_hiera_base_plus.pt": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt",
+    "sam2.1_hiera_small.pt":     "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt",
+    "sam2.1_hiera_tiny.pt":      "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt",
+}
+
 # ImageNet normalisation constants used by both OSNet and ResNet18.
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -84,10 +101,10 @@ class HeavySAMRegistrar:
     # Load / unload
     # ------------------------------------------------------------------
 
-    def load(self) -> None:
+    def load(self, progress_cb=None) -> None:
         """
         Build SAM2 Large and instantiate SAM2ImagePredictor.
-        Raises FileNotFoundError if the checkpoint is missing.
+        Auto-downloads the checkpoint if it is missing and a known URL exists.
         Raises ImportError if the sam2 package is not installed.
         """
         import torch
@@ -97,18 +114,60 @@ class HeavySAMRegistrar:
         config = self._resolve_config()
         ckpt   = self._checkpoint
 
-        if not os.path.isabs(ckpt) and not os.path.exists(ckpt):
-            raise FileNotFoundError(
-                f"SAM2 checkpoint not found: '{ckpt}'\n"
-                "Download sam2.1_hiera_large.pt from Meta's SAM2 releases "
-                "and place it in the project directory, or set the correct "
-                "path in the control panel."
-            )
+        if not os.path.exists(ckpt):
+            self._download_checkpoint(progress_cb=progress_cb)
 
         logger.info("Building SAM2 from config=%s  ckpt=%s", config, ckpt)
         model = build_sam2(config, ckpt, device=self._device)
         self._predictor = SAM2ImagePredictor(model)
         logger.info("SAM2 loaded.  Free VRAM: %.2f GB", self._free_vram_gb())
+
+    def _download_checkpoint(self, progress_cb=None) -> None:
+        """Download the SAM2 checkpoint from Meta's CDN with progress reporting."""
+        import urllib.request
+
+        fname = os.path.basename(self._checkpoint)
+        url = SAM2_CHECKPOINT_URLS.get(fname)
+        if url is None:
+            raise FileNotFoundError(
+                f"SAM2 checkpoint not found: '{self._checkpoint}'\n"
+                f"No auto-download URL is registered for '{fname}'. "
+                "Download it manually from Meta's SAM2 releases and place it "
+                "in the project directory, or set the correct path in the UI."
+            )
+
+        dest = self._checkpoint
+        tmp  = dest + ".download"
+
+        def _reporthook(block_num: int, block_size: int, total_size: int) -> None:
+            if progress_cb is None or total_size <= 0:
+                return
+            downloaded = min(block_num * block_size, total_size)
+            pct        = downloaded * 100 // total_size
+            mb_done    = downloaded / 1_048_576
+            mb_total   = total_size / 1_048_576
+            progress_cb(
+                f"Downloading {fname}… {pct}%  "
+                f"({mb_done:.0f} / {mb_total:.0f} MB)"
+            )
+
+        if progress_cb:
+            progress_cb(f"Downloading {fname} from Meta (~1.9 GB)…")
+        logger.info("Auto-downloading SAM2 checkpoint: %s → %s", url, dest)
+
+        try:
+            urllib.request.urlretrieve(url, tmp, reporthook=_reporthook)
+            os.replace(tmp, dest)
+            if progress_cb:
+                progress_cb(f"Download complete → {dest}")
+            logger.info("SAM2 checkpoint saved to %s", dest)
+        except Exception:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            raise
 
     def unload(self) -> None:
         """Delete the predictor and free GPU memory."""
@@ -276,26 +335,48 @@ class FastSAMTracker:
     # Load / warmup
     # ------------------------------------------------------------------
 
-    def load(self) -> None:
-        """Load FastSAM-s and attempt torch.compile on the backbone."""
+    def load(self, progress_cb=None) -> None:
+        """Load FastSAM-s and attempt torch.compile on the backbone.
+        If the weights file is absent, Ultralytics auto-downloads it; a status
+        message is emitted via progress_cb beforehand so the caller can update
+        the UI.
+        """
         import torch
         from ultralytics import FastSAM
+
+        fname = os.path.basename(self._weights)
+        if not os.path.exists(self._weights):
+            if progress_cb:
+                progress_cb(f"Downloading {fname} (~23 MB via Ultralytics)…")
+            logger.info(
+                "FastSAM weights '%s' not found locally — "
+                "Ultralytics will auto-download on first use.",
+                self._weights,
+            )
 
         self._model = FastSAM(self._weights)
         self._model.to(self._device)
 
+        if progress_cb:
+            progress_cb(f"{fname} loaded.")
+
         # Apply torch.compile to the inner nn.Module, not the Ultralytics
         # wrapper.  fullgraph=False is required because Ultralytics uses
         # dynamic control flow that would break full-graph tracing.
-        try:
-            self._model.model = torch.compile(
-                self._model.model,
-                mode="reduce-overhead",
-                fullgraph=False,
-            )
-            logger.info("FastSAM backbone compiled with torch.compile.")
-        except Exception as exc:
-            logger.warning("torch.compile failed for FastSAM (%s). Eager mode.", exc)
+        # Skipped when Triton is absent — torch.compile defers the TritonMissing
+        # error to the first forward pass, making it uncatchable here.
+        if _triton_available():
+            try:
+                self._model.model = torch.compile(
+                    self._model.model,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
+                logger.info("FastSAM backbone compiled with torch.compile.")
+            except Exception as exc:
+                logger.warning("torch.compile failed for FastSAM (%s). Eager mode.", exc)
+        else:
+            logger.info("Skipping torch.compile for FastSAM — Triton not installed.")
 
     def warmup(self, vid_h: int, vid_w: int) -> None:
         """
@@ -580,16 +661,21 @@ class ReIDEmbedder:
             self._model   = self._load_resnet18()
             self._backend = "resnet18_fallback"
 
-        # Compile for faster batched inference
-        try:
-            self._model = torch.compile(
-                self._model,
-                mode       = "reduce-overhead",
-                fullgraph  = False,
-            )
-            logger.info("Re-ID model compiled with torch.compile.")
-        except Exception as exc:
-            logger.warning("torch.compile failed for Re-ID model (%s). Eager mode.", exc)
+        # Compile for faster batched inference.
+        # Skipped when Triton is absent — torch.compile defers the TritonMissing
+        # error to the first forward pass, making it uncatchable at load time.
+        if _triton_available():
+            try:
+                self._model = torch.compile(
+                    self._model,
+                    mode       = "reduce-overhead",
+                    fullgraph  = False,
+                )
+                logger.info("Re-ID model compiled with torch.compile.")
+            except Exception as exc:
+                logger.warning("torch.compile failed for Re-ID model (%s). Eager mode.", exc)
+        else:
+            logger.info("Skipping torch.compile for Re-ID — Triton not installed.")
 
     def warmup(self) -> None:
         """Trigger compilation graph capture with two dummy passes."""

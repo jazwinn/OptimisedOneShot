@@ -686,7 +686,7 @@ class GPUPipelineProcess(mp.Process):
             weights=cfg["fastsam_weights"],
             device="cuda",
         )
-        fast_sam.load()
+        fast_sam.load(progress_cb=lambda msg: logger.info("[FastSAM] %s", msg))
         fast_sam.warmup(cfg["vid_h"], cfg["vid_w"])
 
         embedder = ReIDEmbedder(

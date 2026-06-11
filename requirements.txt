@@ -9,10 +9,12 @@
 #   Example (CUDA 12.x):
 #     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #
-# Model weights (download separately — not pip-installable):
-#   SAM2 Large   : sam2.1_hiera_large.pt  (Meta SAM2 GitHub releases)
-#   FastSAM-s    : FastSAM-s.pt           (auto-downloaded by Ultralytics on first run)
-#   OSNet x0.25  : osnet_x0_25_imagenet.pth (deep-person-reid GitHub releases, optional)
+# Model weights:
+#   SAM2 Large   : sam2.1_hiera_large.pt  — auto-downloaded on first registration
+#                  (~1.9 GB from dl.fbaipublicfiles.com); saved to project directory
+#   FastSAM-s    : FastSAM-s.pt           — auto-downloaded by Ultralytics on first run
+#   OSNet x0.25  : osnet_x0_25_imagenet.pth — deep-person-reid releases, optional
+#                  (ResNet18 fallback activates automatically if absent)
 
 # ── Core deep learning ────────────────────────────────────────────────
 torch>=2.1.0

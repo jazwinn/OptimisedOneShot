@@ -172,8 +172,9 @@ class VideoCanvas(QGraphicsView):
         """
         h, w = frame_bgr.shape[:2]
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        qimg = QImage(frame_rgb.data.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg)
+        _frame_buf = frame_rgb.tobytes()   # pin buffer; QImage takes a raw pointer
+        qimg = QImage(_frame_buf, w, h, 3 * w, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)   # QPixmap copies pixels — safe after this
         self._current_pixmap = pixmap
         self._render_with_overlay(pixmap)
 
@@ -227,9 +228,12 @@ class VideoCanvas(QGraphicsView):
             mh, mw = mask.shape[:2]
             overlay_rgba = np.zeros((mh, mw, 4), dtype=np.uint8)
             overlay_rgba[mask > 0] = [0, 210, 80, 110]   # green, ~43% opacity
-            overlay_img = QImage(
-                overlay_rgba.tobytes(), mw, mh, 4 * mw, QImage.Format_RGBA8888
-            )
+            # Keep _overlay_buf alive for the full duration of drawImage.
+            # QImage stores a raw C pointer to the buffer — if the Python
+            # bytes object is freed before drawImage reads it, the process
+            # segfaults. Assigning to a local variable pins the refcount.
+            _overlay_buf = overlay_rgba.tobytes()
+            overlay_img = QImage(_overlay_buf, mw, mh, 4 * mw, QImage.Format_RGBA8888)
             painter.drawImage(0, 0, overlay_img)
 
             # Contour outline
@@ -415,6 +419,7 @@ class TimelinePanel(QWidget):
 
     def _on_slider_released(self) -> None:
         self._scrubbing = False
+        self._pending_seek_value = self.slider.value()
         self._emit_seek()
 
     def _on_slider_value_changed(self, value: int) -> None:
@@ -810,7 +815,7 @@ class RegistrationThread(QThread):
             checkpoint=self._sam_weights or None,
             device="cuda",
         )
-        registrar.load()
+        registrar.load(progress_cb=self.progress.emit)
 
         self.progress.emit("Running SAM2 segmentation…")
         result = registrar.register(frame_bgr, self._points)
@@ -907,6 +912,14 @@ class VideoReaderThread(QThread):
         """Request a single-frame seek while in PREVIEW mode."""
         self._cmd_q.put(Cmd("SEEK", frame_idx))
 
+    def play(self, start_frame: int) -> None:
+        """Continuous preview playback at video FPS; emits preview_frame each frame."""
+        self._cmd_q.put(Cmd("PLAY", start_frame))
+
+    def pause(self) -> None:
+        """Pause continuous preview playback."""
+        self._cmd_q.put(Cmd("PAUSE", None))
+
     def start_tracking(self, start_frame: int) -> None:
         """Switch to TRACKING mode and begin feeding raw_frame_queue."""
         self._cmd_q.put(Cmd("START_TRACKING", start_frame))
@@ -936,12 +949,14 @@ class VideoReaderThread(QThread):
         fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
         frame_delay  = 1.0 / fps
         tracking     = False
+        playing      = False   # preview playback — emits preview_frame
         current_idx  = 0
 
         while not self._stop_event.is_set():
             # ── Drain command queue ──────────────────────────────────
+            active = tracking or playing
             try:
-                cmd = self._cmd_q.get(timeout=0.0 if tracking else 0.05)
+                cmd = self._cmd_q.get(timeout=0.0 if active else 0.05)
             except queue.Empty:
                 cmd = None
 
@@ -950,6 +965,7 @@ class VideoReaderThread(QThread):
                     break
 
                 elif cmd.type == "SEEK":
+                    playing = False   # explicit seek interrupts playback
                     idx = int(cmd.payload)
                     cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                     ret, frame = cap.read()
@@ -957,7 +973,18 @@ class VideoReaderThread(QThread):
                         current_idx = idx
                         self.preview_frame.emit(idx, frame.copy())
 
+                elif cmd.type == "PLAY":
+                    playing = True
+                    tracking = False
+                    idx = int(cmd.payload) if cmd.payload is not None else current_idx
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    current_idx = idx
+
+                elif cmd.type == "PAUSE":
+                    playing = False
+
                 elif cmd.type == "START_TRACKING":
+                    playing = False
                     idx = int(cmd.payload)
                     cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                     current_idx = idx
@@ -971,8 +998,23 @@ class VideoReaderThread(QThread):
                     except Exception:
                         pass
 
-            # ── TRACKING: push next frame ────────────────────────────
-            if tracking:
+            # ── PLAYING: emit preview frames at video FPS ────────────
+            if playing:
+                t0 = time.monotonic()
+                ret, frame = cap.read()
+                if not ret:
+                    playing = False
+                    self.end_of_video.emit()
+                    continue
+                self.preview_frame.emit(current_idx, frame.copy())
+                current_idx += 1
+                elapsed = time.monotonic() - t0
+                sleep_t = frame_delay - elapsed
+                if sleep_t > 0.001:
+                    time.sleep(sleep_t)
+
+            # ── TRACKING: push next frame to GPU queue ───────────────
+            elif tracking:
                 t0 = time.monotonic()
                 ret, frame = cap.read()
                 if not ret:
@@ -1223,13 +1265,13 @@ class MainWindow(QMainWindow):
             self._reader_thread.seek(frame_idx)
 
     def _on_play(self) -> None:
-        if self._reader_thread:
-            self._reader_thread.start_tracking(self._current_frame_idx)
+        if self._reader_thread and self._reader_thread.isRunning():
+            self._reader_thread.play(self._current_frame_idx)
             self.timeline.set_playing(True)
 
     def _on_pause(self) -> None:
-        if self._reader_thread:
-            self._reader_thread.stop_tracking()
+        if self._reader_thread and self._reader_thread.isRunning():
+            self._reader_thread.pause()
             self.timeline.set_playing(False)
 
     # ------------------------------------------------------------------
@@ -1579,6 +1621,17 @@ class MainWindow(QMainWindow):
             self._gpu_process.join(timeout=3.0)
             if self._gpu_process.is_alive():
                 self._gpu_process.terminate()
+                self._gpu_process.join(timeout=2.0)  # reap to avoid zombie
+            self._gpu_process = None
+
+        # mp.Queue keeps an internal feeder thread alive until all buffered
+        # items are flushed.  cancel_join_thread() tells it to abandon the
+        # flush so the main process can exit immediately.
+        for q in self._queues.values():
+            try:
+                q.cancel_join_thread()
+            except AttributeError:
+                pass  # threading.Queue — no feeder thread, nothing to do
 
         event.accept()
 
