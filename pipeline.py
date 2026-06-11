@@ -43,6 +43,7 @@ Bbox coordinate convention
 
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import queue
 import threading
@@ -52,6 +53,8 @@ from typing import Any, NamedTuple, Optional
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
