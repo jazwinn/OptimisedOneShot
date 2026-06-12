@@ -64,7 +64,6 @@ from qtpy.QtGui import (
 )
 from qtpy.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -79,7 +78,6 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QRadioButton,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -139,6 +137,25 @@ class VideoCanvas(QGraphicsView):
         self._prompt_points: list[tuple[float, float, int]] = []
         self._current_pixmap: Optional[QPixmap] = None
         self._mask_overlay: Optional[np.ndarray] = None   # H×W uint8
+
+        # Embedding preview overlay — shown top-right after registration
+        self._thumb_widget = QWidget(self)
+        self._thumb_widget.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._thumb_widget.setStyleSheet(
+            "background: rgba(18,18,20,210); border: 1px solid #555; border-radius: 4px;"
+        )
+        _tl = QVBoxLayout(self._thumb_widget)
+        _tl.setContentsMargins(5, 4, 5, 5)
+        _tl.setSpacing(3)
+        self._thumb_title = QLabel("Registered Target")
+        self._thumb_title.setStyleSheet("color: #aaa; font-size: 9px; border: none;")
+        self._thumb_title.setAlignment(Qt.AlignCenter)
+        _tl.addWidget(self._thumb_title)
+        self._thumb_img = QLabel()
+        self._thumb_img.setStyleSheet("border: none;")
+        self._thumb_img.setAlignment(Qt.AlignCenter)
+        _tl.addWidget(self._thumb_img)
+        self._thumb_widget.hide()
 
         self.setRenderHint(QPainter.Antialiasing)
         self.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -203,6 +220,30 @@ class VideoCanvas(QGraphicsView):
         self._mask_overlay = None
         if self._current_pixmap is not None:
             self._render_with_overlay(self._current_pixmap)
+
+    def set_embedding_preview(self, frame_bgr: np.ndarray, bbox: tuple) -> None:
+        """Show a thumbnail of the registered crop in the top-right corner."""
+        x, y, w, h = (int(v) for v in bbox)
+        fh, fw = frame_bgr.shape[:2]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(fw, x + w), min(fh, y + h)
+        crop = frame_bgr[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+        # Scale to fit within 160×120 preserving aspect ratio
+        ch, cw = crop.shape[:2]
+        scale = min(160 / cw, 120 / ch)
+        nw, nh = max(1, int(cw * scale)), max(1, int(ch * scale))
+        crop_small = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
+        crop_rgb = cv2.cvtColor(crop_small, cv2.COLOR_BGR2RGB)
+        _buf = crop_rgb.tobytes()
+        qimg = QImage(_buf, nw, nh, 3 * nw, QImage.Format_RGB888)
+        self._thumb_img.setPixmap(QPixmap.fromImage(qimg.copy()))
+        self._thumb_img.setFixedSize(nw, nh)
+        self._thumb_widget.adjustSize()
+        self._reposition_thumb()
+        self._thumb_widget.show()
+        self._thumb_widget.raise_()
 
     def get_prompt_points(self) -> list[tuple[float, float, int]]:
         """Return a copy of the current prompt points [(x, y, label), ...]."""
@@ -294,6 +335,13 @@ class VideoCanvas(QGraphicsView):
             QRectF(0.0, 0.0, float(self._vid_w), float(self._vid_h)),
             Qt.KeepAspectRatio,
         )
+        self._reposition_thumb()
+
+    def _reposition_thumb(self) -> None:
+        if not self._thumb_widget.isHidden():
+            self._thumb_widget.move(
+                self.width() - self._thumb_widget.width() - 10, 10
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -500,10 +548,6 @@ class ControlPanel(QWidget):
     def get_reid_weights(self) -> str:
         return self.reid_path_edit.text().strip()
 
-    def get_prompt_mode(self) -> int:
-        """Returns 1 for positive, 0 for negative."""
-        return 1 if self.pos_radio.isChecked() else 0
-
     def get_threshold(self) -> float:
         return self.threshold_spin.value()
 
@@ -584,27 +628,17 @@ class ControlPanel(QWidget):
         reid_row.addWidget(reid_browse)
         root.addLayout(reid_row)
 
-        # ── Point Prompts ─────────────────────────────────────────────
-        root.addWidget(self._make_separator("Point Prompts"))
+        # ── Registration ──────────────────────────────────────────────
+        root.addWidget(self._make_separator("Registration"))
 
-        prompt_row = QHBoxLayout()
-        self.pos_radio = QRadioButton("✚ Positive")
-        self.neg_radio = QRadioButton("✖ Negative")
-        self.pos_radio.setChecked(True)
-        prompt_grp = QButtonGroup(self)
-        prompt_grp.addButton(self.pos_radio, 1)
-        prompt_grp.addButton(self.neg_radio, 0)
-        prompt_row.addWidget(self.pos_radio)
-        prompt_row.addWidget(self.neg_radio)
-        root.addLayout(prompt_row)
+        hint = QLabel("Left-click: positive  ·  Right-click: negative")
+        hint.setStyleSheet("color: #666; font-size: 9px;")
+        root.addWidget(hint)
 
         self.clear_pts_btn = QPushButton("Clear Points")
         self.clear_pts_btn.setEnabled(False)
         self.clear_pts_btn.clicked.connect(self.clear_points_requested)
         root.addWidget(self.clear_pts_btn)
-
-        # ── Registration ──────────────────────────────────────────────
-        root.addWidget(self._make_separator("Registration"))
 
         self.register_btn = QPushButton("Register Target (SAM2)")
         self.register_btn.setEnabled(False)
@@ -920,9 +954,16 @@ class VideoReaderThread(QThread):
         """Pause continuous preview playback."""
         self._cmd_q.put(Cmd("PAUSE", None))
 
-    def start_tracking(self, start_frame: int) -> None:
-        """Switch to TRACKING mode and begin feeding raw_frame_queue."""
-        self._cmd_q.put(Cmd("START_TRACKING", start_frame))
+    def start_tracking(self, start_frame: int, batch: bool = False) -> None:
+        """
+        Switch to TRACKING mode and begin feeding raw_frame_queue.
+
+        batch=False (live preview): pace at video FPS and drop frames if the
+        GPU pipeline falls behind — keeps the UI real-time.
+        batch=True (export): never drop and never pace — every frame is pushed
+        with a blocking put so the rendered output is complete.
+        """
+        self._cmd_q.put(Cmd("START_TRACKING", (start_frame, batch)))
 
     def stop_tracking(self) -> None:
         """Return to PREVIEW mode and send None sentinel to raw_frame_queue."""
@@ -949,6 +990,7 @@ class VideoReaderThread(QThread):
         fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
         frame_delay  = 1.0 / fps
         tracking     = False
+        batch        = False   # export mode — no drop, no FPS pacing
         playing      = False   # preview playback — emits preview_frame
         current_idx  = 0
 
@@ -985,13 +1027,18 @@ class VideoReaderThread(QThread):
 
                 elif cmd.type == "START_TRACKING":
                     playing = False
-                    idx = int(cmd.payload)
+                    if isinstance(cmd.payload, tuple):
+                        start_frame, batch = cmd.payload
+                    else:
+                        start_frame, batch = cmd.payload, False
+                    idx = int(start_frame)
                     cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                     current_idx = idx
                     tracking = True
 
                 elif cmd.type == "STOP_TRACKING":
                     tracking = False
+                    batch = False
                     # Signal GPU process to stop consuming
                     try:
                         self._raw_frame_queue.put_nowait(None)
@@ -1024,23 +1071,52 @@ class VideoReaderThread(QThread):
                     except Exception:
                         pass
                     tracking = False
+                    batch = False
                     self.end_of_video.emit()
                     continue
 
-                try:
-                    self._raw_frame_queue.put(
-                        (current_idx, frame.copy()), timeout=0.15
-                    )
-                except queue.Full:
-                    pass   # GPU pipeline is behind; drop this frame
+                if batch:
+                    # Export: never drop. Block until the GPU pipeline accepts
+                    # the frame (with periodic stop checks) so the rendered
+                    # output contains every frame. If the pipeline stops draining
+                    # for too long (e.g. the GPU process died) bail out instead
+                    # of spinning forever.
+                    delivered = False
+                    blocked_for = 0.0
+                    while not self._stop_event.is_set() and blocked_for < 30.0:
+                        try:
+                            self._raw_frame_queue.put(
+                                (current_idx, frame.copy()), timeout=0.5
+                            )
+                            delivered = True
+                            break
+                        except queue.Full:
+                            blocked_for += 0.5
+                    if not delivered:
+                        self.reader_error.emit(
+                            "Export stalled: the GPU pipeline stopped accepting "
+                            "frames. The rendered file may be incomplete."
+                        )
+                        tracking = False
+                        batch = False
+                        continue
+                else:
+                    try:
+                        self._raw_frame_queue.put(
+                            (current_idx, frame.copy()), timeout=0.15
+                        )
+                    except queue.Full:
+                        pass   # GPU pipeline is behind; drop this frame
 
                 current_idx += 1
 
-                # Pace output to video FPS
-                elapsed = time.monotonic() - t0
-                sleep_t = frame_delay - elapsed
-                if sleep_t > 0.001:
-                    time.sleep(sleep_t)
+                # Pace output to video FPS — live preview only. Export runs
+                # as fast as the GPU pipeline can consume frames.
+                if not batch:
+                    elapsed = time.monotonic() - t0
+                    sleep_t = frame_delay - elapsed
+                    if sleep_t > 0.001:
+                        time.sleep(sleep_t)
 
         cap.release()
 
@@ -1334,8 +1410,9 @@ class MainWindow(QMainWindow):
     def _on_registration_done(self, result: dict) -> None:
         self._reg_result = result
 
-        # Show mask overlay on canvas
+        # Show mask overlay and embedding preview thumbnail on canvas
         self.canvas.set_mask_overlay(result["mask"])
+        self.canvas.set_embedding_preview(result["frame_bgr"], result["bbox"])
         self.canvas.set_mode("tracking")   # disable further point-clicking
 
         self.control.register_btn.setEnabled(True)
@@ -1426,9 +1503,13 @@ class MainWindow(QMainWindow):
         # The GPU process will emit progress updates via display_queue meta dicts.
         self._launch_display_worker()
         if self._reader_thread and self._reader_thread.isRunning():
-            self._reader_thread.start_tracking(0)   # always render from frame 0
+            # batch=True → feed every frame, no drops, no FPS pacing.
+            self._reader_thread.start_tracking(0, batch=True)
 
         self.control.set_tracking_active(True)
+
+        # Watchdog: surface a dead GPU process instead of a frozen progress bar.
+        self._watchdog.start(5000)
 
     # ------------------------------------------------------------------
     # Threshold / Alpha / Stride updates → GPU process
@@ -1552,6 +1633,7 @@ class MainWindow(QMainWindow):
             "vid_w":           self._vid_w,
             "vid_h":           self._vid_h,
             "video_fps":       self._video_fps,
+            "total_frames":    self._total_frames,
         }
 
         self._gpu_process = GPUPipelineProcess(
@@ -1578,8 +1660,15 @@ class MainWindow(QMainWindow):
             self._watchdog.stop()
             exit_code = self._gpu_process.exitcode
             self._gpu_process = None
+
+            # Stop the frame feed and clear any export progress UI so a dead
+            # process never leaves the reader blocking or the bar frozen.
+            if self._reader_thread and self._reader_thread.isRunning():
+                self._reader_thread.stop_tracking()
+            self.timeline.show_export_progress(False)
             self.control.set_tracking_active(False)
             self.timeline.set_playing(False)
+
             if exit_code != 0:
                 self._show_error(
                     f"GPU Pipeline Process exited unexpectedly (code {exit_code}).\n"

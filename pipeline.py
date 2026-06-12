@@ -457,6 +457,7 @@ class BlendThread(threading.Thread):
         vid_w:            int,
         video_writer      = None,
         total_frames:     int = 0,
+        batch_render:     bool = False,
     ) -> None:
         super().__init__(daemon=True, name="BlendThread")
         self._in_q        = infer_to_blend_q
@@ -467,6 +468,7 @@ class BlendThread(threading.Thread):
         self._W           = vid_w
         self._writer      = video_writer
         self._total       = total_frames
+        self._batch       = batch_render
         self._frame_count = 0
         self._stream      = None   # created in run() after CUDA context exists
 
@@ -502,8 +504,9 @@ class BlendThread(threading.Thread):
         self._send_sentinel()
 
     def _send_sentinel(self) -> None:
-        if self._total > 0:
-            # Batch render complete — report 100% and exit.
+        if self._batch:
+            # Batch render complete — report 100% so the UI closes out the
+            # export (independent of whether total_frames was known).
             try:
                 self._disp_q.put(
                     (b"", 0, 0, -1, {"export_pct": 100}), timeout=1.0
@@ -630,6 +633,7 @@ class GPUPipelineProcess(mp.Process):
         "vid_w":           1280,
         "vid_h":           720,
         "video_fps":       30.0,
+        "total_frames":    0,
     }
 
     def __init__(
@@ -641,7 +645,7 @@ class GPUPipelineProcess(mp.Process):
         super().__init__(daemon=True)
         self._queues     = queues
         self._reg_result = reg_result
-        self._config     = {**self._CONFIG_DEFAULTS, **config}
+        self._pipeline_cfg = {**self._CONFIG_DEFAULTS, **config}
 
     # ------------------------------------------------------------------
     # Process entry point
@@ -652,7 +656,12 @@ class GPUPipelineProcess(mp.Process):
         Spawned process entry point.
         All imports and CUDA initialisations happen here.
         """
-        import torch
+        import os, torch
+
+        # Mark this as the GPU pipeline process so _compile_safe() in models.py
+        # can reliably skip torch.compile (the daemon-flag check is unreliable on
+        # Windows/spawn because _config['daemon'] is not always propagated).
+        os.environ['_OPTSHOT_GPU_PROC'] = '1'
 
         torch.cuda.set_device(0)
 
@@ -681,7 +690,7 @@ class GPUPipelineProcess(mp.Process):
         import torch
         from models import FastSAMTracker, ReIDEmbedder, EMAGallery, TrackerWrapper
 
-        cfg = self._config
+        cfg = self._pipeline_cfg
         reg = self._reg_result
 
         # ── Phase-2 model loading ─────────────────────────────────────
@@ -726,10 +735,14 @@ class GPUPipelineProcess(mp.Process):
             )
             video_writer.open()
 
-            # Count frames for progress reporting
-            probe = cv2.VideoCapture(cfg["video_path"])
-            total_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
-            probe.release()
+            # Frame count for progress reporting. Prefer the value the main
+            # process already measured (reliable); fall back to a cv2 probe
+            # only if it was not supplied.
+            total_frames = int(cfg.get("total_frames", 0) or 0)
+            if total_frames <= 0:
+                probe = cv2.VideoCapture(cfg["video_path"])
+                total_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
+                probe.release()
 
         # ── Internal queues ───────────────────────────────────────────
         decode_to_infer: queue.Queue = queue.Queue(maxsize=3)
@@ -770,6 +783,7 @@ class GPUPipelineProcess(mp.Process):
             vid_w             = cfg["vid_w"],
             video_writer      = video_writer,
             total_frames      = total_frames,
+            batch_render      = bool(cfg["batch_render"] and cfg["output_path"]),
         )
 
         dec_t.start()

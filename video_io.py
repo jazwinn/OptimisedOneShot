@@ -567,9 +567,15 @@ class VideoWriter:
     def _try_cv2(self) -> bool:
         """
         Try several FourCC codecs in order of preference.
-        'avc1' produces H.264 on Windows/macOS; 'mp4v' is the MPEG-4 fallback.
+
+        'mp4v' (MPEG-4 Part 2) is first because it is encoded by OpenCV's
+        bundled FFmpeg with no external DLL dependency, so it always works.
+        'avc1' (H.264) is tried only as an upgrade — but ONLY if it both opens
+        AND survives a probe write.  On Windows without the openh264 runtime DLL,
+        cv2.VideoWriter('avc1') reports isOpened()==True yet silently encodes
+        nothing, producing an empty/corrupt file; the probe-write detects that.
         """
-        for fourcc_str in ("avc1", "mp4v", "XVID"):
+        for fourcc_str in ("mp4v", "avc1", "XVID"):
             try:
                 fourcc  = cv2.VideoWriter_fourcc(*fourcc_str)
                 writer  = cv2.VideoWriter(
@@ -581,6 +587,7 @@ class VideoWriter:
                 if writer.isOpened():
                     self._cv2_writer = writer
                     self._backend    = "cv2_mp4v"
+                    logger.info("cv2.VideoWriter using fourcc '%s'", fourcc_str)
                     return True
                 writer.release()
             except Exception as exc:

@@ -66,9 +66,32 @@ def build_queues() -> dict:
     }
 
 
+def preload_torch_dlls() -> None:
+    """
+    Import torch ONCE on the main thread so its Windows DLLs are loaded here.
+
+    torch's __init__ runs _load_dll_libraries(), which loads the CUDA DLLs and
+    mutates the process DLL search path. On Windows this is NOT safe to run for
+    the first time from a secondary thread: doing so raises a native access
+    violation that hard-crashes the process (no catchable Python exception).
+
+    RegistrationThread (a QThread) does `import torch` inside run(); if that is
+    torch's first import, the app crashes the instant the user clicks
+    "Register Target". Importing torch here on the main thread caches the module
+    in sys.modules, so the later in-thread `import torch` is a cheap dict lookup
+    with no DLL load.
+
+    NOTE: `import torch` does NOT create a CUDA context (that happens on the
+    first CUDA call). The spawned GPU pipeline process re-imports torch in its
+    own fresh process, so the 'spawn' / CUDA-context contract is unaffected.
+    """
+    import torch  # noqa: F401  (imported for its main-thread DLL-load side effect)
+
+
 def main() -> None:
     """Application entry point."""
     configure_multiprocessing()
+    preload_torch_dlls()
     queues = build_queues()
 
     # Qt must be imported after freeze_support / set_start_method so that the

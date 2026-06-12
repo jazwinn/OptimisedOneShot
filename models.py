@@ -50,6 +50,40 @@ def _triton_available() -> bool:
     except ImportError:
         return False
 
+
+def _compile_safe() -> bool:
+    """
+    Return True only when torch.compile / inductor can actually be used.
+
+    Two conditions must hold:
+    1. Triton is installed (torch.compile requires it on CUDA).
+    2. The calling process is NOT the GPU pipeline child process.
+
+    Condition 2 is needed because torch.compile's inductor backend uses tqdm,
+    which tries to create an mp.RLock() the first time it renders a progress
+    bar.  On Windows, creating a named semaphore requires
+    `multiprocessing.current_process()._config['semprefix']`, which is absent
+    in the spawned GPUPipelineProcess.  This causes a `KeyError: 'semprefix'`
+    that propagates as BackendCompilerFailed and crashes the GPU pipeline.
+    GPUPipelineProcess.run() sets _OPTSHOT_GPU_PROC=1 as a reliable marker;
+    the mp.daemon flag check is unreliable on Windows/spawn (MS Store Python
+    3.11 does not always propagate _config['daemon'] into the child).
+    """
+    import os, multiprocessing as mp
+    if not _triton_available():
+        return False
+    # Primary guard: env var set by GPUPipelineProcess.run() before model loading.
+    # GPUPipelineProcess used to shadow BaseProcess._config with its own pipeline
+    # config dict (which has no 'daemon' key), causing mp.current_process().daemon
+    # to return False even though the process was spawned with daemon=True.
+    # The env-var approach is independent of that attribute and always reliable.
+    if os.environ.get('_OPTSHOT_GPU_PROC'):
+        return False
+    # Belt-and-suspenders: also skip if mp correctly reports daemon=True.
+    if mp.current_process().daemon:
+        return False
+    return True
+
 # Auto-download URLs for SAM2.1 checkpoints (Meta CDN).
 SAM2_CHECKPOINT_URLS: dict[str, str] = {
     "sam2.1_hiera_large.pt":     "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
@@ -365,7 +399,7 @@ class FastSAMTracker:
         # dynamic control flow that would break full-graph tracing.
         # Skipped when Triton is absent — torch.compile defers the TritonMissing
         # error to the first forward pass, making it uncatchable here.
-        if _triton_available():
+        if _compile_safe():
             try:
                 self._model.model = torch.compile(
                     self._model.model,
@@ -376,7 +410,7 @@ class FastSAMTracker:
             except Exception as exc:
                 logger.warning("torch.compile failed for FastSAM (%s). Eager mode.", exc)
         else:
-            logger.info("Skipping torch.compile for FastSAM — Triton not installed.")
+            logger.info("Skipping torch.compile for FastSAM — not safe in this process context.")
 
     def warmup(self, vid_h: int, vid_w: int) -> None:
         """
@@ -664,7 +698,7 @@ class ReIDEmbedder:
         # Compile for faster batched inference.
         # Skipped when Triton is absent — torch.compile defers the TritonMissing
         # error to the first forward pass, making it uncatchable at load time.
-        if _triton_available():
+        if _compile_safe():
             try:
                 self._model = torch.compile(
                     self._model,
@@ -675,7 +709,7 @@ class ReIDEmbedder:
             except Exception as exc:
                 logger.warning("torch.compile failed for Re-ID model (%s). Eager mode.", exc)
         else:
-            logger.info("Skipping torch.compile for Re-ID — Triton not installed.")
+            logger.info("Skipping torch.compile for Re-ID — not safe in this process context.")
 
     def warmup(self) -> None:
         """Trigger compilation graph capture with two dummy passes."""
@@ -957,13 +991,38 @@ class TrackerWrapper:
         frame_bgr  : np.ndarray  uint8 H×W×3
         bbox_xywh  : (x, y, w, h) in pixel coordinates
         """
-        x, y, w, h = (int(v) for v in bbox_xywh)
-        w = max(1, w); h = max(1, h)   # cv2 panics on zero-size bbox
+        x, y, w, h = self._sanitize_bbox(bbox_xywh, frame_bgr.shape)
 
         self._tracker = cv2.TrackerMIL_create()
-        self._tracker.init(frame_bgr, (x, y, w, h))
-        self._last_bbox_xywh      = (x, y, w, h)
+        try:
+            self._tracker.init(frame_bgr, (x, y, w, h))
+        except cv2.error:
+            # MIL needs a background margin to sample negatives; a degenerate
+            # or full-frame box leaves none. Drop the tracker so update() falls
+            # back to the last good bbox instead of crashing the pipeline.
+            self._tracker = None
+            logger.warning("TrackerMIL init failed for bbox=%s; tracking disabled "
+                           "until next re-acquire", (x, y, w, h))
+        self._last_bbox_xywh       = (x, y, w, h)
         self._consecutive_failures = 0
+
+    @staticmethod
+    def _sanitize_bbox(bbox_xywh: tuple, frame_shape: tuple) -> tuple:
+        """
+        Clamp a bbox inside the frame and leave a >=1px margin on every side so
+        the MIL tracker always has room to draw negative samples. Returns
+        (x, y, w, h) ints guaranteed to satisfy cv2's init assertions.
+        """
+        H, W = int(frame_shape[0]), int(frame_shape[1])
+        x, y, w, h = (int(v) for v in bbox_xywh)
+        w = max(1, w); h = max(1, h)
+
+        # Inset the box by 1px from each frame edge so negatives exist.
+        x = min(max(1, x), max(1, W - 2))
+        y = min(max(1, y), max(1, H - 2))
+        w = max(1, min(w, W - 1 - x))
+        h = max(1, min(h, H - 1 - y))
+        return (x, y, w, h)
 
     def update(self, frame_bgr: np.ndarray) -> tuple[bool, tuple, float]:
         """
@@ -979,7 +1038,14 @@ class TrackerWrapper:
             fallback = self._last_bbox_xywh or (0, 0, 64, 64)
             return False, fallback, 0.0
 
-        ok, raw_bbox = self._tracker.update(frame_bgr)
+        try:
+            ok, raw_bbox = self._tracker.update(frame_bgr)
+        except cv2.error:
+            # OpenCV can throw an opaque C++ exception when the tracked box
+            # drifts to the frame edge. Treat as a failed update and coast on
+            # the last known bbox rather than tearing down the GPU process.
+            self._tracker = None
+            ok, raw_bbox = False, self._last_bbox_xywh or (0, 0, 64, 64)
 
         if ok:
             bbox_xywh = tuple(int(v) for v in raw_bbox)
