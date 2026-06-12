@@ -127,9 +127,91 @@ def _bbox_to_mask_cuda(bbox_xyxy: tuple, H: int, W: int):
     return mask
 
 
+def split_masks_by_separators(
+    frame_bgr:   np.ndarray,
+    masks_cuda:  list,
+    bboxes_xyxy: list,
+    *,
+    sep_thresh:  int,
+    min_area:    int,
+    dilate:      int = 1,
+) -> tuple[list, list]:
+    """
+    Split merged FastSAM masks along near-black separator lines.
+
+    The source video is grayscale with each object bounded by a distinct
+    near-black line.  FastSAM frequently merges two touching objects into one
+    mask; cutting the mask at the dark separators and running connected-component
+    labelling recovers the individual objects so Re-ID can match a single one.
+
+    Parameters
+    ----------
+    frame_bgr   : np.ndarray  uint8 H×W×3  current frame.
+    masks_cuda  : list of float32 CUDA tensors, each H×W (full-frame).
+    bboxes_xyxy : list of (x1, y1, x2, y2) tuples, full-frame pixel coords.
+    sep_thresh  : pixels with grayscale intensity <= this are treated as
+                  separator lines (cut out of every mask).
+    min_area    : connected components smaller than this (in pixels) are
+                  discarded as noise.
+    dilate      : iterations of 3×3 dilation applied to the separator mask so
+                  anti-aliased line edges fully sever thin bridges.
+
+    Returns
+    -------
+    (masks_cuda, bboxes_xyxy) in the same format as the input.  A candidate that
+    yields <=1 surviving component is passed through unchanged (safe fallback).
+    """
+    import torch
+
+    if not masks_cuda:
+        return masks_cuda, bboxes_xyxy
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    sep  = (gray <= int(sep_thresh)).astype(np.uint8)   # 1 where separator/black
+    if dilate > 0:
+        kernel = np.ones((3, 3), np.uint8)
+        sep = cv2.dilate(sep, kernel, iterations=int(dilate))
+
+    out_masks:  list = []
+    out_bboxes: list = []
+
+    for m_cuda, box in zip(masks_cuda, bboxes_xyxy):
+        # CUDA float32 mask → CPU uint8, then cut out separator pixels.
+        m_np = (m_cuda > 0.5).to("cpu", torch.uint8).numpy()
+        m_np[sep == 1] = 0
+
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            m_np, connectivity=8
+        )
+
+        # Label 0 is background; keep foreground components above min_area.
+        comps = [
+            i for i in range(1, n_labels)
+            if stats[i, cv2.CC_STAT_AREA] >= min_area
+        ]
+
+        if len(comps) <= 1:
+            # Single object (or nothing significant) — keep the original mask.
+            out_masks.append(m_cuda)
+            out_bboxes.append(box)
+            continue
+
+        labels_cuda = torch.from_numpy(labels).to("cuda")
+        for i in comps:
+            comp_mask = (labels_cuda == i).float()   # H×W float32 CUDA
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            w = int(stats[i, cv2.CC_STAT_WIDTH])
+            h = int(stats[i, cv2.CC_STAT_HEIGHT])
+            out_masks.append(comp_mask)
+            out_bboxes.append((float(x), float(y), float(x + w), float(y + h)))
+
+    return out_masks, out_bboxes
+
+
 def _alpha_blend(frame_cuda, mask_cuda, alpha: float):
     """
-    GPU alpha-composite a green overlay onto frame_cuda where mask_cuda > 0.
+    GPU alpha-composite a cyan overlay onto frame_cuda where mask_cuda > 0.
 
     Parameters
     ----------
@@ -142,8 +224,8 @@ def _alpha_blend(frame_cuda, mask_cuda, alpha: float):
     torch.Tensor  float32 3×H×W BGR [0, 1]
     """
     import torch
-    # Green in BGR: (B=0, G=1, R=0)
-    green = torch.tensor([0.0, 1.0, 0.0], device=frame_cuda.device).view(3, 1, 1)
+    # Cyan in BGR: (B=1, G=1, R=0)
+    cyan = torch.tensor([1.0, 1.0, 0.0], device=frame_cuda.device).view(3, 1, 1)
 
     if mask_cuda.dtype == torch.bool:
         mask_f = mask_cuda.float()
@@ -151,7 +233,7 @@ def _alpha_blend(frame_cuda, mask_cuda, alpha: float):
         mask_f = mask_cuda.clamp(0.0, 1.0)
 
     mask_3 = mask_f.unsqueeze(0)  # 1×H×W → broadcasts over channels
-    out = frame_cuda * (1.0 - alpha * mask_3) + green * (alpha * mask_3)
+    out = frame_cuda * (1.0 - alpha * mask_3) + cyan * (alpha * mask_3)
     return out.clamp_(0.0, 1.0)
 
 
@@ -264,6 +346,8 @@ class InferThread(threading.Thread):
         live_cfg:          dict,
         vid_h:             int,
         vid_w:             int,
+        expected_area:     int = 0,
+        min_area_frac:     float = 0.30,
     ) -> None:
         super().__init__(daemon=True, name="InferThread")
         self._in_q     = decode_to_infer_q
@@ -276,6 +360,11 @@ class InferThread(threading.Thread):
         self._cfg      = live_cfg
         self._H        = vid_h
         self._W        = vid_w
+
+        # Minimum connected-component area kept when splitting merged masks.
+        # Derived from the registered object's area (similar-size prior) with a
+        # small absolute floor so noise specks are never treated as objects.
+        self._min_component_area = max(64, int(expected_area * min_area_frac))
 
         # Mutable inter-frame state
         self._frame_count:    int            = 0
@@ -366,6 +455,14 @@ class InferThread(threading.Thread):
         else:
             masks_cuda, bboxes_xyxy = self._fsam.predict_full(frame_bgr_np)
             mode = "full"
+
+        # ── 2b. Split merged masks at black separator lines ───────────
+        if self._cfg.get("separator_split", True) and masks_cuda:
+            masks_cuda, bboxes_xyxy = split_masks_by_separators(
+                frame_bgr_np, masks_cuda, bboxes_xyxy,
+                sep_thresh = int(self._cfg.get("separator_thresh", 40)),
+                min_area   = self._min_component_area,
+            )
 
         # ── 3. Batch Re-ID embed ──────────────────────────────────────
         if not bboxes_xyxy:
@@ -634,6 +731,9 @@ class GPUPipelineProcess(mp.Process):
         "vid_h":           720,
         "video_fps":       30.0,
         "total_frames":    0,
+        "separator_split":         True,
+        "separator_thresh":        40,
+        "min_component_area_frac": 0.30,
     }
 
     def __init__(
@@ -722,6 +822,16 @@ class GPUPipelineProcess(mp.Process):
         if reg.get("frame_bgr") is not None:
             tracker.init(reg["frame_bgr"], init_bbox_xywh)
 
+        # Registered object area drives the min-component filter when splitting
+        # merged masks (similar-size prior). Fall back to the bbox area if the
+        # mask is unavailable.
+        reg_mask = reg.get("mask")
+        if reg_mask is not None:
+            registered_area = int((np.asarray(reg_mask) > 0).sum())
+        else:
+            bx, by, bw, bh = init_bbox_xywh
+            registered_area = int(bw * bh)
+
         # ── VideoWriter (batch render only) ───────────────────────────
         video_writer = None
         total_frames = 0
@@ -751,9 +861,11 @@ class GPUPipelineProcess(mp.Process):
 
         # Shared live config — mutated by the command loop below.
         live_cfg: dict = {
-            "match_threshold": cfg["match_threshold"],
-            "overlay_alpha":   cfg["overlay_alpha"],
-            "stride":          cfg["stride"],
+            "match_threshold":  cfg["match_threshold"],
+            "overlay_alpha":    cfg["overlay_alpha"],
+            "stride":           cfg["stride"],
+            "separator_split":  cfg["separator_split"],
+            "separator_thresh": cfg["separator_thresh"],
         }
 
         # ── Spawn stage threads ───────────────────────────────────────
@@ -773,6 +885,8 @@ class GPUPipelineProcess(mp.Process):
             live_cfg          = live_cfg,
             vid_h             = cfg["vid_h"],
             vid_w             = cfg["vid_w"],
+            expected_area     = registered_area,
+            min_area_frac     = float(cfg["min_component_area_frac"]),
         )
         bld_t = BlendThread(
             infer_to_blend_q  = infer_to_blend,
@@ -814,6 +928,10 @@ class GPUPipelineProcess(mp.Process):
                 live_cfg["overlay_alpha"] = float(cmd.payload)
             elif cmd.type == "UPDATE_STRIDE":
                 live_cfg["stride"] = max(1, int(cmd.payload))
+            elif cmd.type == "UPDATE_SEP_SPLIT":
+                live_cfg["separator_split"] = bool(cmd.payload)
+            elif cmd.type == "UPDATE_SEP_THRESH":
+                live_cfg["separator_thresh"] = max(0, int(cmd.payload))
 
         # ── Graceful shutdown ─────────────────────────────────────────
         stop_event.set()

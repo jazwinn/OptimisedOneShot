@@ -222,6 +222,7 @@ class HeavySAMRegistrar:
         self,
         frame_bgr: np.ndarray,
         points: list[tuple[float, float, int]],
+        separator_thresh: int = 40,
     ) -> dict:
         """
         Run SAM2 one-shot segmentation.
@@ -273,6 +274,14 @@ class HeavySAMRegistrar:
         best_idx  = int(np.argmax(scores))
         best_mask = masks[best_idx].astype(bool)   # H×W bool
 
+        # ── Split at black separator lines ────────────────────────────
+        # If the SAM2 mask spans two touching objects, cut it along the
+        # near-black separators and keep only the component under the user's
+        # positive click — so the reference embedding is a single object.
+        best_mask = self._isolate_clicked_component(
+            best_mask, frame_bgr, points, separator_thresh
+        )
+
         # Bounding box from mask
         rows = np.where(best_mask.any(axis=1))[0]
         cols = np.where(best_mask.any(axis=0))[0]
@@ -294,6 +303,52 @@ class HeavySAMRegistrar:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _isolate_clicked_component(
+        mask_bool:        np.ndarray,
+        frame_bgr:        np.ndarray,
+        points:           list[tuple[float, float, int]],
+        separator_thresh: int,
+    ) -> np.ndarray:
+        """
+        Cut a SAM2 mask along near-black separator lines and return only the
+        connected component containing the user's positive click.
+
+        Returns the input unchanged when there is no positive point or the cut
+        yields a single component (so non-line-separated videos are unaffected).
+        """
+        pos = [(x, y) for x, y, l in points if l == 1]
+        if not pos:
+            return mask_bool
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        sep  = (gray <= int(separator_thresh)).astype(np.uint8)
+        sep  = cv2.dilate(sep, np.ones((3, 3), np.uint8), iterations=1)
+
+        cut = mask_bool.astype(np.uint8)
+        cut[sep == 1] = 0
+
+        n_labels, labels = cv2.connectedComponents(cut, connectivity=8)
+        if n_labels <= 2:
+            # 0 = background, 1 = single object → nothing merged to split.
+            return mask_bool
+
+        H, W = mask_bool.shape[:2]
+        # Prefer the label directly under the first positive click.
+        px, py = pos[0]
+        cx = min(max(0, int(round(px))), W - 1)
+        cy = min(max(0, int(round(py))), H - 1)
+        target_label = int(labels[cy, cx])
+
+        if target_label == 0:
+            # Click landed on a separator/cut pixel — choose the largest
+            # foreground component as the best guess.
+            counts = np.bincount(labels.ravel())
+            counts[0] = 0
+            target_label = int(np.argmax(counts))
+
+        return labels == target_label
 
     @staticmethod
     def _resolve_config() -> str:
@@ -369,11 +424,17 @@ class FastSAMTracker:
     # Load / warmup
     # ------------------------------------------------------------------
 
-    def load(self, progress_cb=None) -> None:
+    def load(self, progress_cb=None, skip_compile: bool = False) -> None:
         """Load FastSAM-s and attempt torch.compile on the backbone.
         If the weights file is absent, Ultralytics auto-downloads it; a status
         message is emitted via progress_cb beforehand so the caller can update
         the UI.
+
+        skip_compile=True prevents torch.compile regardless of _compile_safe().
+        Use this for one-shot registration calls where compile overhead is wasted
+        and where the compiled OptimizedModule causes Ultralytics' setup_model()
+        to crash on `model or self.args.model` (triggers __len__ which is
+        unsupported on OptimizedModule).
         """
         import torch
         from ultralytics import FastSAM
@@ -399,7 +460,8 @@ class FastSAMTracker:
         # dynamic control flow that would break full-graph tracing.
         # Skipped when Triton is absent — torch.compile defers the TritonMissing
         # error to the first forward pass, making it uncatchable here.
-        if _compile_safe():
+        # Also skipped when skip_compile=True (e.g. one-shot registration).
+        if _compile_safe() and not skip_compile:
             try:
                 self._model.model = torch.compile(
                     self._model.model,
@@ -410,7 +472,16 @@ class FastSAMTracker:
             except Exception as exc:
                 logger.warning("torch.compile failed for FastSAM (%s). Eager mode.", exc)
         else:
-            logger.info("Skipping torch.compile for FastSAM — not safe in this process context.")
+            logger.info("Skipping torch.compile for FastSAM — not safe or not needed in this context.")
+
+    def unload(self) -> None:
+        """Delete the model and free GPU memory."""
+        import torch, gc
+        if self._model is not None:
+            del self._model
+            self._model = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def warmup(self, vid_h: int, vid_w: int) -> None:
         """
@@ -1091,3 +1162,69 @@ class TrackerWrapper:
         iou   = inter / union if union > 0 else 0.0
 
         return 0.15 + 0.75 * iou
+
+
+# ---------------------------------------------------------------------------
+# FastSAM registration helper
+# ---------------------------------------------------------------------------
+
+def _pick_best_fastsam_mask(
+    masks_cuda: list,
+    user_bbox_xyxy: tuple,
+    pos_points: list,
+    neg_points: list,
+):
+    """
+    Select the best FastSAM candidate mask given a user-drawn bbox and optional
+    positive / negative point hints.
+
+    Priority
+    --------
+    1. If positive points: pick the mask containing the most positive clicks.
+    2. Reject masks that cover any negative click.
+    3. Fallback: highest IoU with the user-drawn bbox region.
+    4. Final fallback: largest area.
+    """
+    import torch
+
+    if len(masks_cuda) == 1:
+        return masks_cuda[0]
+
+    m0 = masks_cuda[0]
+    H = m0.shape[-2] if m0.dim() >= 2 else int(m0.shape[0])
+    W = m0.shape[-1] if m0.dim() >= 2 else int(m0.shape[1])
+
+    x1, y1, x2, y2 = user_bbox_xyxy
+    bbox_mask = torch.zeros(H, W, device=m0.device)
+    r_x1 = max(0, int(x1)); r_y1 = max(0, int(y1))
+    r_x2 = min(W, int(x2)); r_y2 = min(H, int(y2))
+    bbox_mask[r_y1:r_y2, r_x1:r_x2] = 1.0
+
+    scores = []
+    for m in masks_cuda:
+        m_bin = (m > 0.5).float()
+
+        # Reject if a negative click falls inside this mask
+        neg_hit = any(
+            m_bin[min(H - 1, max(0, int(py))), min(W - 1, max(0, int(px)))] > 0.5
+            for px, py in neg_points
+        )
+        if neg_hit:
+            scores.append(-1.0)
+            continue
+
+        if pos_points:
+            pos_hits = sum(
+                float(m_bin[min(H - 1, max(0, int(py))), min(W - 1, max(0, int(px)))] > 0.5)
+                for px, py in pos_points
+            )
+            scores.append(pos_hits)
+        else:
+            inter = (m_bin * bbox_mask).sum()
+            union = (m_bin + bbox_mask).clamp(0, 1).sum()
+            scores.append(float(inter / union.clamp(min=1)))
+
+    best_idx = int(max(range(len(scores)), key=lambda i: scores[i]))
+    if scores[best_idx] < 0:
+        best_idx = int(max(range(len(masks_cuda)), key=lambda i: masks_cuda[i].sum()))
+    return masks_cuda[best_idx]

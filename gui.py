@@ -111,16 +111,21 @@ class VideoCanvas(QGraphicsView):
     that mapToScene(click_pos) returns original video pixel coordinates
     directly — no manual scale/offset arithmetic needed.
 
-    Left-click  → positive point prompt (green, label=1).
-    Right-click → negative point prompt (red,   label=0).
+    Registration workflow:
+      1. Left-click drag → draw bounding box (rubber-band).
+      2. After bbox drawn: left-click → positive point, right-click → negative point.
+      3. Click "Register Target" to run FastSAM on the bbox + optional point hints.
 
     Signals
     -------
     point_added(x_vid, y_vid, label)
-        Emitted on each click when mode == 'registration'.
+        Emitted on each point click when mode == 'registration' and bbox is drawn.
+    bbox_drawn(x1, y1, x2, y2)
+        Emitted when a bounding box drag is finalized.
     """
 
     point_added = Signal(float, float, int)
+    bbox_drawn  = Signal(float, float, float, float)   # x1, y1, x2, y2 frame-space
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -137,6 +142,10 @@ class VideoCanvas(QGraphicsView):
         self._prompt_points: list[tuple[float, float, int]] = []
         self._current_pixmap: Optional[QPixmap] = None
         self._mask_overlay: Optional[np.ndarray] = None   # H×W uint8
+        # Rubber-band bounding box state (registration phase 1)
+        self._reg_bbox: Optional[tuple[float, float, float, float]] = None  # xyxy
+        self._dragging: bool = False
+        self._drag_origin: Optional[QPointF] = None
 
         # Embedding preview overlay — shown top-right after registration
         self._thumb_widget = QWidget(self)
@@ -215,11 +224,18 @@ class VideoCanvas(QGraphicsView):
             self._render_with_overlay(self._current_pixmap)
 
     def clear_prompts(self) -> None:
-        """Remove all prompt points and the mask overlay."""
+        """Remove all prompt points, bounding box, and the mask overlay."""
         self._prompt_points.clear()
         self._mask_overlay = None
+        self._reg_bbox = None
+        self._dragging = False
+        self._drag_origin = None
         if self._current_pixmap is not None:
             self._render_with_overlay(self._current_pixmap)
+
+    def get_reg_bbox(self) -> Optional[tuple[float, float, float, float]]:
+        """Return the drawn bounding box as (x1, y1, x2, y2) or None."""
+        return self._reg_bbox
 
     def set_embedding_preview(self, frame_bgr: np.ndarray, bbox: tuple) -> None:
         """Show a thumbnail of the registered crop in the top-right corner."""
@@ -254,8 +270,13 @@ class VideoCanvas(QGraphicsView):
     # ------------------------------------------------------------------
 
     def _render_with_overlay(self, base_pixmap: QPixmap) -> None:
-        """Paint mask overlay and prompt dots onto a copy of base_pixmap."""
-        if not self._mask_overlay is not None and not self._prompt_points:
+        """Paint mask overlay, bounding box, and prompt dots onto a copy of base_pixmap."""
+        nothing_to_draw = (
+            self._mask_overlay is None
+            and not self._prompt_points
+            and self._reg_bbox is None
+        )
+        if nothing_to_draw:
             self._pixmap_item.setPixmap(base_pixmap)
             return
 
@@ -263,12 +284,12 @@ class VideoCanvas(QGraphicsView):
         painter = QPainter(result)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # --- Mask overlay -------------------------------------------------
+        # --- Mask overlay (cyan) ------------------------------------------
         if self._mask_overlay is not None:
             mask = self._mask_overlay
             mh, mw = mask.shape[:2]
             overlay_rgba = np.zeros((mh, mw, 4), dtype=np.uint8)
-            overlay_rgba[mask > 0] = [0, 210, 80, 110]   # green, ~43% opacity
+            overlay_rgba[mask > 0] = [0, 210, 210, 110]   # cyan, ~43% opacity
             # Keep _overlay_buf alive for the full duration of drawImage.
             # QImage stores a raw C pointer to the buffer — if the Python
             # bytes object is freed before drawImage reads it, the process
@@ -277,11 +298,11 @@ class VideoCanvas(QGraphicsView):
             overlay_img = QImage(_overlay_buf, mw, mh, 4 * mw, QImage.Format_RGBA8888)
             painter.drawImage(0, 0, overlay_img)
 
-            # Contour outline
+            # Contour outline in cyan
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-            pen = QPen(QColor(0, 255, 100), 2.0)
+            pen = QPen(QColor(0, 210, 210), 2.0)
             pen.setCosmetic(True)
             painter.setPen(pen)
             for contour in contours:
@@ -291,6 +312,16 @@ class VideoCanvas(QGraphicsView):
                     for i in range(n - 1):
                         painter.drawLine(pts[i], pts[i + 1])
                     painter.drawLine(pts[-1], pts[0])
+
+        # --- Bounding box (dashed cyan) -----------------------------------
+        if self._reg_bbox is not None:
+            x1, y1, x2, y2 = self._reg_bbox
+            box_pen = QPen(QColor(0, 210, 210), 2.0)
+            box_pen.setStyle(Qt.DashLine)
+            box_pen.setCosmetic(True)
+            painter.setPen(box_pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(QRectF(x1, y1, x2 - x1, y2 - y1))
 
         # --- Prompt dots --------------------------------------------------
         for x_vid, y_vid, label in self._prompt_points:
@@ -321,13 +352,53 @@ class VideoCanvas(QGraphicsView):
         scene_pt = self.mapToScene(event.pos())
         x_vid = max(0.0, min(float(scene_pt.x()), float(self._vid_w - 1)))
         y_vid = max(0.0, min(float(scene_pt.y()), float(self._vid_h - 1)))
-        label = 1 if event.button() == Qt.LeftButton else 0
 
-        self._prompt_points.append((x_vid, y_vid, label))
-        if self._current_pixmap is not None:
-            self._render_with_overlay(self._current_pixmap)
+        if event.button() == Qt.LeftButton:
+            if self._reg_bbox is None:
+                # Phase 1: start rubber-band bbox drag
+                self._dragging = True
+                self._drag_origin = QPointF(x_vid, y_vid)
+            else:
+                # Phase 2: add positive point refinement
+                self._prompt_points.append((x_vid, y_vid, 1))
+                if self._current_pixmap is not None:
+                    self._render_with_overlay(self._current_pixmap)
+                self.point_added.emit(x_vid, y_vid, 1)
+        elif event.button() == Qt.RightButton and self._reg_bbox is not None:
+            # Phase 2: add negative point refinement (only after bbox drawn)
+            self._prompt_points.append((x_vid, y_vid, 0))
+            if self._current_pixmap is not None:
+                self._render_with_overlay(self._current_pixmap)
+            self.point_added.emit(x_vid, y_vid, 0)
 
-        self.point_added.emit(x_vid, y_vid, label)
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging and self._drag_origin is not None:
+            scene_pt = self.mapToScene(event.pos())
+            x_vid = max(0.0, min(float(scene_pt.x()), float(self._vid_w - 1)))
+            y_vid = max(0.0, min(float(scene_pt.y()), float(self._vid_h - 1)))
+            ox, oy = self._drag_origin.x(), self._drag_origin.y()
+            self._reg_bbox = (min(ox, x_vid), min(oy, y_vid),
+                              max(ox, x_vid), max(oy, y_vid))
+            if self._current_pixmap is not None:
+                self._render_with_overlay(self._current_pixmap)
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._mode == "registration" and event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self._drag_origin = None
+            if self._reg_bbox is not None:
+                x1, y1, x2, y2 = self._reg_bbox
+                if (x2 - x1) < 5 or (y2 - y1) < 5:
+                    # Too small — treat as a stray click, clear and ignore
+                    self._reg_bbox = None
+                    if self._current_pixmap is not None:
+                        self._render_with_overlay(self._current_pixmap)
+                else:
+                    self.bbox_drawn.emit(x1, y1, x2, y2)
+        else:
+            super().mouseReleaseEvent(event)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -506,7 +577,6 @@ class ControlPanel(QWidget):
     export_requested      = Signal()
     clear_points_requested = Signal()
 
-    sam_weights_changed    = Signal(str)
     fastsam_weights_changed = Signal(str)
     reid_weights_changed   = Signal(str)
 
@@ -514,6 +584,8 @@ class ControlPanel(QWidget):
     alpha_changed     = Signal(float)   # overlay opacity 0.10–0.90
     stride_changed    = Signal(int)     # inference stride (every N frames)
     live_preview_toggled = Signal(bool)
+    sep_split_toggled  = Signal(bool)   # split merged masks at black separators
+    sep_thresh_changed = Signal(int)    # separator darkness threshold 0–120
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -539,9 +611,6 @@ class ControlPanel(QWidget):
         self.track_btn.setEnabled(not active)
         self.stop_btn.setEnabled(active)
 
-    def get_sam_weights(self) -> str:
-        return self.sam_path_edit.text().strip()
-
     def get_fastsam_weights(self) -> str:
         return self.fastsam_path_edit.text().strip()
 
@@ -559,6 +628,12 @@ class ControlPanel(QWidget):
 
     def get_live_preview(self) -> bool:
         return self.live_preview_check.isChecked()
+
+    def get_separator_split(self) -> bool:
+        return self.sep_split_check.isChecked()
+
+    def get_separator_thresh(self) -> int:
+        return self.sep_thresh_spin.value()
 
     # ------------------------------------------------------------------
     # Build UI
@@ -589,19 +664,6 @@ class ControlPanel(QWidget):
         # ── Model Weights ─────────────────────────────────────────────
         root.addWidget(self._make_separator("Model Weights"))
 
-        # SAM2
-        root.addWidget(QLabel("SAM2 Checkpoint:"))
-        sam_row = QHBoxLayout()
-        self.sam_path_edit = QLineEdit()
-        self.sam_path_edit.setPlaceholderText("sam2.1_hiera_large.pt")
-        self.sam_path_edit.textChanged.connect(self.sam_weights_changed)
-        sam_row.addWidget(self.sam_path_edit)
-        sam_browse = QPushButton("…")
-        sam_browse.setFixedWidth(28)
-        sam_browse.clicked.connect(lambda: self._browse_weight(self.sam_path_edit))
-        sam_row.addWidget(sam_browse)
-        root.addLayout(sam_row)
-
         # FastSAM
         root.addWidget(QLabel("FastSAM Weights:"))
         fsam_row = QHBoxLayout()
@@ -631,16 +693,16 @@ class ControlPanel(QWidget):
         # ── Registration ──────────────────────────────────────────────
         root.addWidget(self._make_separator("Registration"))
 
-        hint = QLabel("Left-click: positive  ·  Right-click: negative")
+        hint = QLabel("1. Drag bbox  2. +/- click refine  3. Register")
         hint.setStyleSheet("color: #666; font-size: 9px;")
         root.addWidget(hint)
 
-        self.clear_pts_btn = QPushButton("Clear Points")
+        self.clear_pts_btn = QPushButton("Clear / Reset")
         self.clear_pts_btn.setEnabled(False)
         self.clear_pts_btn.clicked.connect(self.clear_points_requested)
         root.addWidget(self.clear_pts_btn)
 
-        self.register_btn = QPushButton("Register Target (SAM2)")
+        self.register_btn = QPushButton("Register Target (FastSAM)")
         self.register_btn.setEnabled(False)
         self.register_btn.setStyleSheet(
             "QPushButton { background: #1a6b3c; color: white; font-weight: bold; }"
@@ -690,6 +752,29 @@ class ControlPanel(QWidget):
         self.stride_spin.valueChanged.connect(self.stride_changed)
         str_row.addWidget(self.stride_spin)
         root.addLayout(str_row)
+
+        # Separator splitting — cut merged masks at black lines between objects
+        self.sep_split_check = QCheckBox("Split by separators")
+        self.sep_split_check.setChecked(True)
+        self.sep_split_check.setToolTip(
+            "Split touching objects apart along the near-black lines that "
+            "separate them. Disable for videos without separator lines."
+        )
+        self.sep_split_check.toggled.connect(self.sep_split_toggled)
+        root.addWidget(self.sep_split_check)
+
+        sep_row = QHBoxLayout()
+        sep_row.addWidget(QLabel("Separator darkness ≤:"))
+        self.sep_thresh_spin = QSpinBox()
+        self.sep_thresh_spin.setRange(0, 120)
+        self.sep_thresh_spin.setValue(40)
+        self.sep_thresh_spin.setToolTip(
+            "Pixels darker than this (0–255 grayscale) are treated as separator "
+            "lines and cut out when splitting masks."
+        )
+        self.sep_thresh_spin.valueChanged.connect(self.sep_thresh_changed)
+        sep_row.addWidget(self.sep_thresh_spin)
+        root.addLayout(sep_row)
 
         # Live preview toggle
         self.live_preview_check = QCheckBox("Live Preview Mode")
@@ -769,17 +854,18 @@ class ControlPanel(QWidget):
 class RegistrationThread(QThread):
     """
     Runs in a dedicated QThread so the Qt main loop stays responsive during
-    heavy SAM2 inference (~3–8 seconds on first run including model load).
+    FastSAM inference and Re-ID embedding.
 
     Execution order
     ---------------
     1. Open video at _video_path, seek to _frame_idx, read one frame.
-    2. Load HeavySAMRegistrar (SAM2 Large fp16, ~3.5 GB VRAM).
-    3. Run register() with the user's point prompts → mask + bbox.
-    4. Load ReIDEmbedder (OSNet / ResNet18, ~0.3 GB VRAM).
-    5. Crop the target region, extract normalised reference embedding.
-    6. Unload SAM2 + ReID embedder (del + empty_cache).
-    7. Emit registration_done with all serialised CPU results.
+    2. Load FastSAMTracker (~12 MB), run predict_roi() on the user-drawn bbox.
+    3. Select the best candidate mask (by positive-point hit or IoU).
+    4. Optionally isolate the clicked connected component along separator lines.
+    5. Load ReIDEmbedder (OSNet / ResNet18, ~0.3 GB VRAM).
+    6. Crop the target region, extract normalised reference embedding.
+    7. Unload FastSAM + ReID embedder (del + empty_cache).
+    8. Emit registration_done with all serialised CPU results.
     """
 
     registration_done = Signal(dict)   # {mask, bbox, reid_emb, score, frame_bgr, frame_idx}
@@ -790,19 +876,21 @@ class RegistrationThread(QThread):
         self,
         video_path: str,
         frame_idx: int,
+        bbox: tuple,
         points: list[tuple[float, float, int]],
-        sam_weights: str,
         fastsam_weights: str,
         reid_weights: str,
+        separator_thresh: int = 40,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self._video_path    = video_path
-        self._frame_idx     = frame_idx
-        self._points        = list(points)   # [(x, y, label), ...]
-        self._sam_weights   = sam_weights
+        self._video_path      = video_path
+        self._frame_idx       = frame_idx
+        self._bbox            = bbox          # (x1, y1, x2, y2) drawn by user
+        self._points          = list(points)  # [(x, y, label), ...]
         self._fastsam_weights = fastsam_weights
-        self._reid_weights  = reid_weights
+        self._reid_weights    = reid_weights
+        self._separator_thresh = separator_thresh
 
     def run(self) -> None:
         import torch
@@ -813,8 +901,7 @@ class RegistrationThread(QThread):
             torch.cuda.empty_cache()
             self.error.emit(
                 "GPU Out of Memory during registration.\n"
-                "Close other GPU applications and try again, or switch to a "
-                "smaller SAM2 checkpoint (e.g. sam2.1_hiera_base_plus.pt)."
+                "Close other GPU applications and try again."
             )
         except Exception:
             self.error.emit(
@@ -823,11 +910,10 @@ class RegistrationThread(QThread):
 
     def _run_inner(self) -> None:
         import torch
-        from models import HeavySAMRegistrar, ReIDEmbedder
+        from models import FastSAMTracker, ReIDEmbedder, HeavySAMRegistrar, _pick_best_fastsam_mask
 
-        pos_pts = [(x, y) for x, y, l in self._points if l == 1]
-        if not pos_pts:
-            self.error.emit("At least one positive point is required.")
+        if self._bbox is None:
+            self.error.emit("Draw a bounding box on the frame before registering.")
             return
 
         # ── Read target frame ────────────────────────────────────────
@@ -843,19 +929,46 @@ class RegistrationThread(QThread):
             self.error.emit(f"Could not read frame {self._frame_idx}.")
             return
 
-        # ── SAM2 registration ────────────────────────────────────────
-        self.progress.emit("Loading SAM2 Large (fp16)… this may take a moment.")
-        registrar = HeavySAMRegistrar(
-            checkpoint=self._sam_weights or None,
+        # ── FastSAM registration ─────────────────────────────────────
+        self.progress.emit("Loading FastSAM…")
+        fast_sam = FastSAMTracker(
+            weights=self._fastsam_weights or "FastSAM-s.pt",
             device="cuda",
         )
-        registrar.load(progress_cb=self.progress.emit)
+        fast_sam.load(progress_cb=self.progress.emit, skip_compile=True)
 
-        self.progress.emit("Running SAM2 segmentation…")
-        result = registrar.register(frame_bgr, self._points)
-        mask  = result["mask"]    # np.uint8  H×W
-        bbox  = result["bbox"]    # (x, y, w, h) in pixels
-        score = result["score"]   # float
+        self.progress.emit("Running FastSAM segmentation…")
+        masks_cuda, _ = fast_sam.predict_roi(frame_bgr, self._bbox)
+
+        if not masks_cuda:
+            self.error.emit(
+                "FastSAM found no masks inside the drawn bounding box.\n"
+                "Try drawing a larger box or adjusting FastSAM weights."
+            )
+            fast_sam.unload()
+            return
+
+        pos_pts = [(x, y) for x, y, l in self._points if l == 1]
+        neg_pts = [(x, y) for x, y, l in self._points if l == 0]
+        best_mask_cuda = _pick_best_fastsam_mask(masks_cuda, self._bbox, pos_pts, neg_pts)
+        best_mask_np   = (best_mask_cuda > 0.5).cpu().numpy().astype(np.uint8)
+
+        # Isolate the connected component at the positive click (separator-aware)
+        if pos_pts:
+            best_mask_np = HeavySAMRegistrar._isolate_clicked_component(
+                best_mask_np.astype(bool), frame_bgr, self._points, self._separator_thresh
+            ).astype(np.uint8)
+
+        ys, xs = np.where(best_mask_np > 0)
+        if len(xs) == 0:
+            x1, y1, x2, y2 = (int(v) for v in self._bbox)
+            bbox_xywh = (x1, y1, x2 - x1, y2 - y1)
+        else:
+            bx1, by1 = int(xs.min()), int(ys.min())
+            bx2, by2 = int(xs.max()) + 1, int(ys.max()) + 1
+            bbox_xywh = (bx1, by1, bx2 - bx1, by2 - by1)
+
+        fast_sam.unload()
 
         # ── Re-ID embedding ──────────────────────────────────────────
         self.progress.emit("Extracting reference embedding…")
@@ -866,7 +979,7 @@ class RegistrationThread(QThread):
         embedder.load()
 
         fh, fw = frame_bgr.shape[:2]
-        x, y, w, h = bbox
+        x, y, w, h = bbox_xywh
         x1 = max(0, int(x))
         y1 = max(0, int(y))
         x2 = min(fw, int(x + w))
@@ -876,27 +989,22 @@ class RegistrationThread(QThread):
         if crop.size == 0:
             self.error.emit("Registration bounding box collapsed to zero area.")
             embedder.unload()
-            registrar.unload()
             return
 
         reid_emb = embedder.embed(crop)  # np.float32 (D,)
 
-        # ── Unload heavy models ──────────────────────────────────────
-        self.progress.emit("Purging SAM2 + Re-ID from VRAM…")
-        registrar.unload()
+        # ── Unload models ────────────────────────────────────────────
+        self.progress.emit("Purging Re-ID from VRAM…")
         embedder.unload()
 
         free_gb = torch.cuda.mem_get_info()[0] / 1e9
-        self.progress.emit(
-            f"Target registered  ·  {free_gb:.1f} GB VRAM free  ·  "
-            f"SAM2 score {score:.3f}"
-        )
+        self.progress.emit(f"Target registered  ·  {free_gb:.1f} GB VRAM free")
 
         self.registration_done.emit({
-            "mask":      mask,
-            "bbox":      bbox,
+            "mask":      best_mask_np * 255,
+            "bbox":      bbox_xywh,
             "reid_emb":  reid_emb,
-            "score":     score,
+            "score":     1.0,
             "frame_bgr": frame_bgr.copy(),
             "frame_idx": self._frame_idx,
         })
@@ -1274,6 +1382,8 @@ class MainWindow(QMainWindow):
         cp.threshold_changed.connect(self._on_threshold_changed)
         cp.alpha_changed.connect(self._on_alpha_changed)
         cp.stride_changed.connect(self._on_stride_changed)
+        cp.sep_split_toggled.connect(self._on_sep_split_toggled)
+        cp.sep_thresh_changed.connect(self._on_sep_thresh_changed)
 
         # Timeline → MainWindow
         tl.seek_requested.connect(self._on_seek)
@@ -1282,6 +1392,7 @@ class MainWindow(QMainWindow):
 
         # Canvas → MainWindow
         cv.point_added.connect(self._on_point_added)
+        cv.bbox_drawn.connect(self._on_bbox_drawn)
 
     # ------------------------------------------------------------------
     # Slot: Load Video
@@ -1326,7 +1437,7 @@ class MainWindow(QMainWindow):
             f"{self._vid_w}×{self._vid_h}  ·  {self._video_fps:.2f} fps  ·  "
             f"{self._total_frames} frames"
         )
-        self._status_bar.showMessage("Video loaded. Left-click positive / right-click negative points, then Register.")
+        self._status_bar.showMessage("Video loaded. Drag to draw a bounding box around the target, then click Register.")
 
         # Start reader thread for scrubbing
         self._start_reader_thread()
@@ -1355,17 +1466,23 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_point_added(self, x: float, y: float, label: int) -> None:
-        # Points are stored in canvas; just update UI feedback
         n_pos = sum(1 for _, _, l in self.canvas.get_prompt_points() if l == 1)
         n_neg = sum(1 for _, _, l in self.canvas.get_prompt_points() if l == 0)
         self._status_bar.showMessage(
-            f"Prompts: {n_pos} positive, {n_neg} negative  ·  "
-            "Right-click for negative points  ·  Click 'Register Target' when ready."
+            f"Refinement points: {n_pos} positive, {n_neg} negative  ·  "
+            "Click 'Register Target' when ready."
         )
 
     def _on_clear_points(self) -> None:
         self.canvas.clear_prompts()
-        self._status_bar.showMessage("Points cleared.")
+        self._status_bar.showMessage("Cleared. Draw a new bounding box to start over.")
+
+    def _on_bbox_drawn(self, x1: float, y1: float, x2: float, y2: float) -> None:
+        w, h = int(x2 - x1), int(y2 - y1)
+        self._status_bar.showMessage(
+            f"Bbox drawn ({w}×{h} px)  ·  "
+            "Optionally left/right click to add +/− points, then Register."
+        )
 
     # ------------------------------------------------------------------
     # Slot: Register Target
@@ -1375,23 +1492,29 @@ class MainWindow(QMainWindow):
         if not self._video_path:
             return
 
-        points = self.canvas.get_prompt_points()
-        if not any(l == 1 for _, _, l in points):
-            self._show_error("Add at least one positive point (left-click) before registering.")
+        bbox = self.canvas.get_reg_bbox()
+        if bbox is None:
+            self._show_error(
+                "Draw a bounding box first.\n"
+                "Left-click and drag on the video to outline the target."
+            )
             return
 
+        points = self.canvas.get_prompt_points()
+
         self.control.register_btn.setEnabled(False)
-        self.control.set_status("Loading SAM2…")
+        self.control.set_status("Loading FastSAM…")
         self._status_bar.showMessage("Registering target — please wait…")
 
         self._reg_thread = RegistrationThread(
-            video_path    = self._video_path,
-            frame_idx     = self._current_frame_idx,
-            points        = points,
-            sam_weights   = self.control.get_sam_weights(),
-            fastsam_weights = self.control.get_fastsam_weights(),
-            reid_weights  = self.control.get_reid_weights(),
-            parent        = self,
+            video_path       = self._video_path,
+            frame_idx        = self._current_frame_idx,
+            bbox             = bbox,
+            points           = points,
+            fastsam_weights  = self.control.get_fastsam_weights(),
+            reid_weights     = self.control.get_reid_weights(),
+            separator_thresh = self.control.get_separator_thresh(),
+            parent           = self,
         )
         self._reg_thread.registration_done.connect(self._on_registration_done)
         self._reg_thread.progress.connect(self._on_registration_progress)
@@ -1418,11 +1541,10 @@ class MainWindow(QMainWindow):
         self.control.register_btn.setEnabled(True)
         self.control.set_track_controls_enabled(True)
         self.control.set_status(
-            f"Registered ✓  score={result['score']:.3f}  "
-            f"bbox={result['bbox']}"
+            f"Registered ✓  bbox={result['bbox']}"
         )
         self._status_bar.showMessage(
-            "Target registered. Click 'Start Live Preview' to begin tracking."
+            "Target registered (FastSAM). Click 'Start Live Preview' to begin tracking."
         )
 
     # ------------------------------------------------------------------
@@ -1523,6 +1645,12 @@ class MainWindow(QMainWindow):
 
     def _on_stride_changed(self, value: int) -> None:
         self._send_pipeline_cmd("UPDATE_STRIDE", value)
+
+    def _on_sep_split_toggled(self, enabled: bool) -> None:
+        self._send_pipeline_cmd("UPDATE_SEP_SPLIT", enabled)
+
+    def _on_sep_thresh_changed(self, value: int) -> None:
+        self._send_pipeline_cmd("UPDATE_SEP_THRESH", value)
 
     def _send_pipeline_cmd(self, cmd_type: str, payload: Any = None) -> None:
         try:
@@ -1634,6 +1762,8 @@ class MainWindow(QMainWindow):
             "vid_h":           self._vid_h,
             "video_fps":       self._video_fps,
             "total_frames":    self._total_frames,
+            "separator_split":  self.control.get_separator_split(),
+            "separator_thresh": self.control.get_separator_thresh(),
         }
 
         self._gpu_process = GPUPipelineProcess(
