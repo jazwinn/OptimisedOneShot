@@ -1253,3 +1253,32 @@ def _pick_best_fastsam_mask(
     if scores[best_idx] < 0:
         best_idx = int(max(range(len(masks_cuda)), key=lambda i: masks_cuda[i].sum()))
     return masks_cuda[best_idx]
+
+
+def _mask_to_quad(mask_np: np.ndarray) -> Optional[np.ndarray]:
+    """Fit a 4-corner quadrilateral to the largest contour of a binary mask.
+
+    Iteratively relaxes approxPolyDP epsilon until ≤4 corners remain;
+    falls back to minAreaRect if the shape is too irregular to simplify.
+
+    Returns a (4, 2) int32 array of corner points, or None if the mask is empty.
+    """
+    contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) < 16:
+        return None
+    hull = cv2.convexHull(contour)
+    arc  = cv2.arcLength(hull, True)
+    approx = hull
+    for eps_factor in (0.02, 0.04, 0.06, 0.10, 0.15, 0.20, 0.30):
+        candidate = cv2.approxPolyDP(hull, eps_factor * arc, True)
+        approx = candidate
+        if len(candidate) <= 4:
+            break
+    if len(approx) == 4:
+        return approx.reshape(4, 2).astype(np.int32)
+    rect = cv2.minAreaRect(contour)
+    box  = cv2.boxPoints(rect)
+    return np.int32(np.round(box))

@@ -97,6 +97,30 @@ def _pad_bbox_xyxy(
     return (x1, y1, x2, y2)
 
 
+def _union_bboxes_padded(
+    bboxes_xyxy: list,
+    pad_frac: float,
+    frame_h: int,
+    frame_w: int,
+) -> tuple:
+    """
+    Return a single xyxy ROI that is the union of all input bboxes (xyxy),
+    padded by pad_frac of the union's dimensions.
+    """
+    x1 = min(b[0] for b in bboxes_xyxy)
+    y1 = min(b[1] for b in bboxes_xyxy)
+    x2 = max(b[2] for b in bboxes_xyxy)
+    y2 = max(b[3] for b in bboxes_xyxy)
+    pw = (x2 - x1) * pad_frac
+    ph = (y2 - y1) * pad_frac
+    return (
+        max(0, int(x1 - pw)),
+        max(0, int(y1 - ph)),
+        min(frame_w, int(x2 + pw)),
+        min(frame_h, int(y2 + ph)),
+    )
+
+
 def _crop_bgr(frame_bgr: np.ndarray, bbox_xyxy: tuple) -> Optional[np.ndarray]:
     """
     Crop frame_bgr to the given xyxy bounding box, clamped to frame
@@ -245,6 +269,56 @@ def _alpha_blend(frame_cuda, mask_cuda, alpha: float):
     return out.clamp_(0.0, 1.0)
 
 
+def _draw_quad_overlays(rgb_np: "np.ndarray", mask_np: "np.ndarray") -> None:
+    """
+    Fit a 4-corner polygon to each distinct blob in mask_np and draw it
+    in-place on rgb_np (H×W×3 uint8 RGB).
+
+    For each blob:
+      • semi-transparent cyan fill
+      • solid cyan outline
+      • cyan corner circles
+    """
+    import cv2
+    import numpy as np
+
+    MIN_AREA = 200   # ignore tiny noise blobs
+
+    contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    for contour in contours:
+        if cv2.contourArea(contour) < MIN_AREA:
+            continue
+
+        # Fit quad: relax approxPolyDP until ≤4 corners.
+        hull = cv2.convexHull(contour)
+        arc  = cv2.arcLength(hull, True)
+        approx = hull
+        for eps in (0.02, 0.04, 0.06, 0.10, 0.15, 0.20, 0.30):
+            cand = cv2.approxPolyDP(hull, eps * arc, True)
+            approx = cand
+            if len(cand) <= 4:
+                break
+        if len(approx) == 4:
+            quad = approx.reshape(4, 2).astype(np.int32)
+        else:
+            rect = cv2.minAreaRect(contour)
+            quad = np.int32(np.round(cv2.boxPoints(rect)))
+
+        # Semi-transparent fill (blend 22% cyan over current pixels).
+        overlay = rgb_np.copy()
+        cv2.fillPoly(overlay, [quad], (0, 230, 230))   # RGB cyan
+        cv2.addWeighted(overlay, 0.22, rgb_np, 0.78, 0, rgb_np)
+
+        # Solid outline.
+        cv2.polylines(rgb_np, [quad], isClosed=True, color=(0, 230, 230), thickness=2)
+
+        # Corner circles.
+        for pt in quad:
+            cv2.circle(rgb_np, tuple(pt), 5, (0, 230, 230), -1)
+            cv2.circle(rgb_np, tuple(pt), 5, (255, 255, 255), 1)
+
+
 # ---------------------------------------------------------------------------
 # DecodeThread
 # ---------------------------------------------------------------------------
@@ -380,6 +454,9 @@ class InferThread(threading.Thread):
         self._last_bbox_xyxy: Optional[tuple] = None
         self._last_sim:       float          = 0.0
         self._no_match_streak: int           = 0
+        # All accepted bboxes (xyxy) from the last full Re-ID scan.
+        # Used to widen the ROI so every matched object stays in frame.
+        self._last_accepted_bboxes: list     = []
 
     def run(self) -> None:
         import torch
@@ -444,25 +521,39 @@ class InferThread(threading.Thread):
         """
         import torch
 
-        stride   = max(1, int(self._cfg.get("stride", 1)))
-        H, W     = self._H, self._W
-        run_full = (self._frame_count % stride == 0)
+        stride         = max(1, int(self._cfg.get("stride", 1)))
+        detection_mode = bool(self._cfg.get("detection_mode", False))
+        H, W           = self._H, self._W
+        run_full       = detection_mode or (self._frame_count % stride == 0)
 
         # ── 1. Tracker predict ────────────────────────────────────────
-        ok, bbox_xywh, conf = self._tracker.update(frame_bgr_np)
-        bbox_xyxy = _xywh_to_xyxy(bbox_xywh) if ok else self._last_bbox_xyxy or (0, 0, W, H)
+        if detection_mode:
+            # No tracker state — bbox falls back to full frame.
+            ok, bbox_xywh, conf = False, (0, 0, W, H), 0.0
+            bbox_xyxy = (0, 0, W, H)
+        else:
+            ok, bbox_xywh, conf = self._tracker.update(frame_bgr_np)
+            bbox_xyxy = _xywh_to_xyxy(bbox_xywh) if ok else self._last_bbox_xyxy or (0, 0, W, H)
 
         # ── 2. FastSAM (ROI or full) ──────────────────────────────────
         if not run_full:
             return self._propagate(idx, frame_cuda, bbox_xyxy, ok)
 
-        if conf >= 0.4:
-            roi_xyxy = _pad_bbox_xyxy(bbox_xywh, 0.20, H, W)
+        if detection_mode or conf < 0.4:
+            masks_cuda, bboxes_xyxy = self._fsam.predict_full(frame_bgr_np)
+            mode = "detect" if detection_mode else "full"
+        else:
+            # Widen ROI to cover every object matched last frame, not just
+            # the single tracker-predicted object.
+            tracker_xyxy = _xywh_to_xyxy(bbox_xywh)
+            if self._last_accepted_bboxes:
+                roi_xyxy = _union_bboxes_padded(
+                    self._last_accepted_bboxes + [tracker_xyxy], 0.20, H, W
+                )
+            else:
+                roi_xyxy = _pad_bbox_xyxy(bbox_xywh, 0.20, H, W)
             masks_cuda, bboxes_xyxy = self._fsam.predict_roi(frame_bgr_np, roi_xyxy)
             mode = "roi"
-        else:
-            masks_cuda, bboxes_xyxy = self._fsam.predict_full(frame_bgr_np)
-            mode = "full"
 
         # ── 2b. Split merged masks at black separator lines ───────────
         if self._cfg.get("separator_split", True) and masks_cuda:
@@ -508,15 +599,19 @@ class InferThread(threading.Thread):
             # so the ROI crop stays focused on the primary target.
             x1b, y1b, x2b, y2b = (int(v) for v in best_bbox)
             self._tracker.init(frame_bgr_np, (x1b, y1b, x2b - x1b, y2b - y1b))
-            self._last_mask_cuda  = best_mask
-            self._last_bbox_xyxy  = best_bbox
-            self._last_sim        = sim
-            self._no_match_streak = 0
+            self._last_mask_cuda      = best_mask
+            self._last_bbox_xyxy      = best_bbox
+            self._last_sim            = sim
+            self._no_match_streak     = 0
+            # Remember all accepted bboxes so the next ROI covers every object.
+            self._last_accepted_bboxes = [bboxes_xyxy[i] for i in valid_idxs]
         else:
             self._no_match_streak += 1
             best_mask = self._last_mask_cuda
             best_bbox = bbox_xyxy
             accepted  = False
+            if self._no_match_streak > 5:
+                self._last_accepted_bboxes = []
 
         # Emit re-acquiring status if target has been lost for a while
         if self._no_match_streak >= 30:
@@ -662,14 +757,26 @@ class BlendThread(threading.Thread):
         self._stream.synchronize()
 
         # ── Pull to CPU ────────────────────────────────────────────────
+        # .copy() detaches from the torch tensor's storage so OpenCV can use
+        # this array as a read-write dst argument without layout complaints.
         out_rgb_np = (
             out_rgb_cuda
             .mul(255.0)
             .byte()
             .permute(1, 2, 0)   # 3×H×W → H×W×3
+            .contiguous()
             .cpu()
             .numpy()
-        )   # H×W×3 uint8 RGB
+            .copy()
+        )   # H×W×3 uint8 RGB, fully owned writable C-contiguous array
+
+        # ── Polygon overlay on each segmented blob ─────────────────────
+        if accepted and mask_cuda is not None:
+            mask_np = (
+                (mask_cuda > 0.5).byte().contiguous().cpu().numpy().copy()
+                .astype(np.uint8) * 255
+            )
+            _draw_quad_overlays(out_rgb_np, mask_np)
 
         raw_bytes = out_rgb_np.tobytes()
 
@@ -751,6 +858,7 @@ class GPUPipelineProcess(mp.Process):
         "separator_split":         True,
         "separator_thresh":        40,
         "min_component_area_frac": 0.30,
+        "detection_mode":          False,
     }
 
     def __init__(
@@ -949,6 +1057,8 @@ class GPUPipelineProcess(mp.Process):
                 live_cfg["separator_split"] = bool(cmd.payload)
             elif cmd.type == "UPDATE_SEP_THRESH":
                 live_cfg["separator_thresh"] = max(0, int(cmd.payload))
+            elif cmd.type == "UPDATE_DETECTION_MODE":
+                live_cfg["detection_mode"] = bool(cmd.payload)
 
         # ── Graceful shutdown ─────────────────────────────────────────
         stop_event.set()

@@ -146,6 +146,8 @@ class VideoCanvas(QGraphicsView):
         self._reg_bbox: Optional[tuple[float, float, float, float]] = None  # xyxy
         self._dragging: bool = False
         self._drag_origin: Optional[QPointF] = None
+        # 4-corner polygon fitted to the live mask (set by MaskPreviewThread result)
+        self._reg_quad: Optional[np.ndarray] = None   # (4, 2) int32
 
         # Embedding preview overlay — shown top-right after registration
         self._thumb_widget = QWidget(self)
@@ -215,18 +217,27 @@ class VideoCanvas(QGraphicsView):
         self._pixmap_item.setPixmap(pixmap)
 
     def set_mask_overlay(self, mask: Optional[np.ndarray]) -> None:
-        """
-        Set a SAM2 registration mask (H×W uint8) to render as a semi-transparent
-        overlay. Pass None to clear.
-        """
+        """Set a mask (H×W uint8) as the semi-transparent overlay. Pass None to clear."""
         self._mask_overlay = mask
+        self._reg_quad = None   # raw mask replaces any existing quad
+        if self._current_pixmap is not None:
+            self._render_with_overlay(self._current_pixmap)
+
+    def set_quad_overlay(self, quad_pts: Optional[np.ndarray]) -> None:
+        """Replace the raw mask fill with a fitted 4-corner polygon overlay.
+
+        quad_pts: (4, 2) int32 array of corner coordinates in frame space, or None to clear.
+        """
+        self._reg_quad = quad_pts
+        self._mask_overlay = None   # polygon replaces the blob fill
         if self._current_pixmap is not None:
             self._render_with_overlay(self._current_pixmap)
 
     def clear_prompts(self) -> None:
-        """Remove all prompt points, bounding box, and the mask overlay."""
+        """Remove all prompt points, bounding box, mask overlay, and quad polygon."""
         self._prompt_points.clear()
         self._mask_overlay = None
+        self._reg_quad = None
         self._reg_bbox = None
         self._dragging = False
         self._drag_origin = None
@@ -270,9 +281,10 @@ class VideoCanvas(QGraphicsView):
     # ------------------------------------------------------------------
 
     def _render_with_overlay(self, base_pixmap: QPixmap) -> None:
-        """Paint mask overlay, bounding box, and prompt dots onto a copy of base_pixmap."""
+        """Paint mask overlay, quad polygon, bounding box, and prompt dots onto base_pixmap."""
         nothing_to_draw = (
             self._mask_overlay is None
+            and self._reg_quad is None
             and not self._prompt_points
             and self._reg_bbox is None
         )
@@ -284,21 +296,18 @@ class VideoCanvas(QGraphicsView):
         painter = QPainter(result)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # --- Mask overlay (cyan) ------------------------------------------
-        if self._mask_overlay is not None:
+        # --- Raw mask overlay (cyan blob, shown when no quad fitted yet) -----
+        if self._mask_overlay is not None and self._reg_quad is None:
             mask = self._mask_overlay
             mh, mw = mask.shape[:2]
             overlay_rgba = np.zeros((mh, mw, 4), dtype=np.uint8)
             overlay_rgba[mask > 0] = [0, 210, 210, 110]   # cyan, ~43% opacity
-            # Keep _overlay_buf alive for the full duration of drawImage.
-            # QImage stores a raw C pointer to the buffer — if the Python
-            # bytes object is freed before drawImage reads it, the process
-            # segfaults. Assigning to a local variable pins the refcount.
+            # Pin the buffer — QImage holds a raw C pointer.
             _overlay_buf = overlay_rgba.tobytes()
             overlay_img = QImage(_overlay_buf, mw, mh, 4 * mw, QImage.Format_RGBA8888)
             painter.drawImage(0, 0, overlay_img)
 
-            # Contour outline in cyan
+            # Contour outline
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
@@ -312,6 +321,35 @@ class VideoCanvas(QGraphicsView):
                     for i in range(n - 1):
                         painter.drawLine(pts[i], pts[i + 1])
                     painter.drawLine(pts[-1], pts[0])
+
+        # --- 4-corner polygon (replaces raw mask once quad is computed) ------
+        if self._reg_quad is not None:
+            pts_np = self._reg_quad   # (4, 2) int32
+            h_px = base_pixmap.height()
+            w_px = base_pixmap.width()
+
+            # Semi-transparent cyan fill via numpy → QImage overlay
+            poly_rgba = np.zeros((h_px, w_px, 4), dtype=np.uint8)
+            cv2.fillPoly(poly_rgba, [pts_np], (0, 210, 210, 80))
+            _poly_buf = poly_rgba.tobytes()
+            poly_img = QImage(_poly_buf, w_px, h_px, 4 * w_px, QImage.Format_RGBA8888)
+            painter.drawImage(0, 0, poly_img)
+
+            # Solid cyan outline
+            outline_pen = QPen(QColor(0, 230, 230), 2.5)
+            outline_pen.setCosmetic(True)
+            painter.setPen(outline_pen)
+            painter.setBrush(Qt.NoBrush)
+            qpts = [QPointF(float(p[0]), float(p[1])) for p in pts_np]
+            n = len(qpts)
+            for i in range(n):
+                painter.drawLine(qpts[i], qpts[(i + 1) % n])
+
+            # Corner circles
+            painter.setBrush(QBrush(QColor(0, 230, 230)))
+            painter.setPen(QPen(QColor(255, 255, 255), 1.5))
+            for p in qpts:
+                painter.drawEllipse(p, 5.0, 5.0)
 
         # --- Bounding box (dashed cyan) -----------------------------------
         if self._reg_bbox is not None:
@@ -586,6 +624,7 @@ class ControlPanel(QWidget):
     live_preview_toggled = Signal(bool)
     sep_split_toggled  = Signal(bool)   # split merged masks at black separators
     sep_thresh_changed = Signal(int)    # separator darkness threshold 0–120
+    detection_mode_toggled = Signal(bool)  # skip tracker, full-frame detect every frame
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -631,6 +670,9 @@ class ControlPanel(QWidget):
 
     def get_separator_split(self) -> bool:
         return self.sep_split_check.isChecked()
+
+    def get_detection_mode(self) -> bool:
+        return self.detection_mode_check.isChecked()
 
     def get_separator_thresh(self) -> int:
         return self.sep_thresh_spin.value()
@@ -782,6 +824,17 @@ class ControlPanel(QWidget):
         self.live_preview_check.toggled.connect(self.live_preview_toggled)
         root.addWidget(self.live_preview_check)
 
+        # Detection mode — skip tracker, full-frame FastSAM every frame
+        self.detection_mode_check = QCheckBox("Detection Mode (no tracker)")
+        self.detection_mode_check.setChecked(False)
+        self.detection_mode_check.setToolTip(
+            "Skip the tracker entirely. Run full-frame FastSAM on every frame "
+            "and match against the registered embedding — like a per-frame detector. "
+            "More accurate for fast/erratic motion; slower than tracking mode."
+        )
+        self.detection_mode_check.toggled.connect(self.detection_mode_toggled)
+        root.addWidget(self.detection_mode_check)
+
         # ── Execution ─────────────────────────────────────────────────
         root.addWidget(self._make_separator("Execution"))
 
@@ -861,7 +914,7 @@ class MaskPreviewThread(QThread):
     the bounding box or adds / removes prompt points.
     """
 
-    preview_ready = Signal(object, tuple)   # (mask_np H×W uint8 * 255, bbox_xywh)
+    preview_ready = Signal(object, tuple, object)   # (mask_np H×W uint8*255, bbox_xywh, quad_pts|(4,2)int32|None)
     preview_error = Signal(str)
     progress      = Signal(str)
 
@@ -935,7 +988,10 @@ class MaskPreviewThread(QThread):
             bx2, by2 = int(xs.max()) + 1, int(ys.max()) + 1
             bbox_xywh = (bx1, by1, bx2 - bx1, by2 - by1)
 
-        self.preview_ready.emit(best_mask_np * 255, bbox_xywh)
+        from models import _mask_to_quad
+        quad_pts = _mask_to_quad(best_mask_np)
+
+        self.preview_ready.emit(best_mask_np * 255, bbox_xywh, quad_pts)
 
 
 # ---------------------------------------------------------------------------
@@ -974,6 +1030,7 @@ class RegistrationThread(QThread):
         separator_thresh: int = 40,
         precomputed_mask: Optional[np.ndarray] = None,
         precomputed_bbox: Optional[tuple] = None,
+        precomputed_quad: Optional[np.ndarray] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -986,6 +1043,7 @@ class RegistrationThread(QThread):
         self._separator_thresh = separator_thresh
         self._precomputed_mask = precomputed_mask   # H×W uint8 *255, from MaskPreviewThread
         self._precomputed_bbox = precomputed_bbox   # (x, y, w, h)
+        self._precomputed_quad = precomputed_quad   # (4, 2) int32, from MaskPreviewThread
 
     def run(self) -> None:
         import torch
@@ -1078,12 +1136,33 @@ class RegistrationThread(QThread):
         embedder.load()
 
         fh, fw = frame_bgr.shape[:2]
-        x, y, w, h = bbox_xywh
-        x1 = max(0, int(x))
-        y1 = max(0, int(y))
-        x2 = min(fw, int(x + w))
-        y2 = min(fh, int(y + h))
-        crop = frame_bgr[y1:y2, x1:x2]
+
+        # Determine the quad to use: prefer precomputed; fall back to bbox rect.
+        quad = self._precomputed_quad
+        if quad is None and best_mask_np is not None:
+            from models import _mask_to_quad
+            quad = _mask_to_quad(best_mask_np)
+
+        if quad is not None:
+            # Crop to the polygon's axis-aligned bounding rect, then zero
+            # pixels outside the polygon so Re-ID focuses on the object shape.
+            qx, qy, qw, qh = cv2.boundingRect(quad)
+            x1 = max(0, qx)
+            y1 = max(0, qy)
+            x2 = min(fw, qx + qw)
+            y2 = min(fh, qy + qh)
+            crop_full = frame_bgr.copy()
+            poly_mask = np.zeros((fh, fw), dtype=np.uint8)
+            cv2.fillPoly(poly_mask, [quad], 255)
+            crop_full[poly_mask == 0] = 0   # black out non-polygon pixels
+            crop = crop_full[y1:y2, x1:x2]
+        else:
+            x, y, w, h = bbox_xywh
+            x1 = max(0, int(x))
+            y1 = max(0, int(y))
+            x2 = min(fw, int(x + w))
+            y2 = min(fh, int(y + h))
+            crop = frame_bgr[y1:y2, x1:x2]
 
         if crop.size == 0:
             self.error.emit("Registration bounding box collapsed to zero area.")
@@ -1419,6 +1498,7 @@ class MainWindow(QMainWindow):
         # Live mask preview state (populated by MaskPreviewThread)
         self._live_mask:      Optional[np.ndarray] = None
         self._live_bbox_xywh: Optional[tuple]      = None
+        self._live_quad:      Optional[np.ndarray] = None   # (4, 2) int32
 
         # Debounce timer — fires 400 ms after the last bbox/point change
         self._preview_debounce = QTimer()
@@ -1493,6 +1573,7 @@ class MainWindow(QMainWindow):
         cp.stride_changed.connect(self._on_stride_changed)
         cp.sep_split_toggled.connect(self._on_sep_split_toggled)
         cp.sep_thresh_changed.connect(self._on_sep_thresh_changed)
+        cp.detection_mode_toggled.connect(self._on_detection_mode_toggled)
 
         # Timeline → MainWindow
         tl.seek_requested.connect(self._on_seek)
@@ -1590,6 +1671,7 @@ class MainWindow(QMainWindow):
             self._preview_thread.wait(500)
         self._live_mask = None
         self._live_bbox_xywh = None
+        self._live_quad = None
         self.canvas.clear_prompts()
         self._status_bar.showMessage("Cleared. Draw a new bounding box to start over.")
 
@@ -1600,6 +1682,7 @@ class MainWindow(QMainWindow):
         )
         self._live_mask = None
         self._live_bbox_xywh = None
+        self._live_quad = None
         self._preview_debounce.start(400)
 
     # ------------------------------------------------------------------
@@ -1634,16 +1717,21 @@ class MainWindow(QMainWindow):
         )
         self._preview_thread.start()
 
-    def _on_mask_preview_ready(self, mask: np.ndarray, bbox_xywh: tuple) -> None:
+    def _on_mask_preview_ready(self, mask: np.ndarray, bbox_xywh: tuple, quad_pts) -> None:
         self._live_mask      = mask
         self._live_bbox_xywh = bbox_xywh
-        self.canvas.set_mask_overlay(mask)
+        self._live_quad      = quad_pts   # None or (4,2) int32
+        if quad_pts is not None:
+            self.canvas.set_quad_overlay(quad_pts)
+        else:
+            self.canvas.set_mask_overlay(mask)
         pts = self.canvas.get_prompt_points()
         n_pos = sum(1 for _, _, l in pts if l == 1)
         n_neg = sum(1 for _, _, l in pts if l == 0)
         pt_str = f"  ·  {n_pos}+ {n_neg}− pts" if pts else ""
+        quad_str = "  ·  polygon fitted" if quad_pts is not None else ""
         self._status_bar.showMessage(
-            f"Mask preview ready{pt_str}  ·  Click 'Register Target' to embed."
+            f"Mask preview ready{pt_str}{quad_str}  ·  Click 'Register Target' to embed."
         )
 
     def _on_mask_preview_error(self, msg: str) -> None:
@@ -1686,6 +1774,7 @@ class MainWindow(QMainWindow):
             separator_thresh  = self.control.get_separator_thresh(),
             precomputed_mask  = self._live_mask,
             precomputed_bbox  = self._live_bbox_xywh,
+            precomputed_quad  = self._live_quad,
             parent            = self,
         )
         self._reg_thread.registration_done.connect(self._on_registration_done)
@@ -1705,8 +1794,11 @@ class MainWindow(QMainWindow):
     def _on_registration_done(self, result: dict) -> None:
         self._reg_result = result
 
-        # Show mask overlay and embedding preview thumbnail on canvas
-        self.canvas.set_mask_overlay(result["mask"])
+        # Show polygon (if fitted) or raw mask overlay on canvas
+        if self._live_quad is not None:
+            self.canvas.set_quad_overlay(self._live_quad)
+        else:
+            self.canvas.set_mask_overlay(result["mask"])
         self.canvas.set_embedding_preview(result["frame_bgr"], result["bbox"])
         self.canvas.set_mode("tracking")   # disable further point-clicking
 
@@ -1830,6 +1922,9 @@ class MainWindow(QMainWindow):
     def _on_sep_thresh_changed(self, value: int) -> None:
         self._send_pipeline_cmd("UPDATE_SEP_THRESH", value)
 
+    def _on_detection_mode_toggled(self, enabled: bool) -> None:
+        self._send_pipeline_cmd("UPDATE_DETECTION_MODE", enabled)
+
     def _send_pipeline_cmd(self, cmd_type: str, payload: Any = None) -> None:
         try:
             self._queues["pipeline_cmd_queue"].put_nowait(
@@ -1942,6 +2037,7 @@ class MainWindow(QMainWindow):
             "total_frames":    self._total_frames,
             "separator_split":  self.control.get_separator_split(),
             "separator_thresh": self.control.get_separator_thresh(),
+            "detection_mode":   self.control.get_detection_mode(),
         }
 
         self._gpu_process = GPUPipelineProcess(
