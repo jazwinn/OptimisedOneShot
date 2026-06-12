@@ -668,7 +668,7 @@ class ControlPanel(QWidget):
         root.addWidget(QLabel("FastSAM Weights:"))
         fsam_row = QHBoxLayout()
         self.fastsam_path_edit = QLineEdit()
-        self.fastsam_path_edit.setPlaceholderText("FastSAM-s.pt")
+        self.fastsam_path_edit.setPlaceholderText("FastSAM-x.pt")
         self.fastsam_path_edit.textChanged.connect(self.fastsam_weights_changed)
         fsam_row.addWidget(self.fastsam_path_edit)
         fsam_browse = QPushButton("…")
@@ -848,6 +848,97 @@ class ControlPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# MaskPreviewThread
+# ---------------------------------------------------------------------------
+
+class MaskPreviewThread(QThread):
+    """
+    Runs FastSAM on the current frame + bbox + points and emits the mask for
+    immediate canvas overlay.  Re-ID is NOT run here — that only happens when
+    the user clicks "Register Target".
+
+    Triggered automatically (with debounce) whenever the user draws or adjusts
+    the bounding box or adds / removes prompt points.
+    """
+
+    preview_ready = Signal(object, tuple)   # (mask_np H×W uint8 * 255, bbox_xywh)
+    preview_error = Signal(str)
+    progress      = Signal(str)
+
+    def __init__(
+        self,
+        video_path: str,
+        frame_idx: int,
+        bbox: tuple,
+        points: list,
+        fastsam_weights: str,
+        separator_thresh: int = 40,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._video_path      = video_path
+        self._frame_idx       = frame_idx
+        self._bbox            = bbox
+        self._points          = list(points)
+        self._fastsam_weights = fastsam_weights
+        self._separator_thresh = separator_thresh
+
+    def run(self) -> None:
+        try:
+            self._run_inner()
+        except Exception:
+            self.preview_error.emit(traceback.format_exc())
+
+    def _run_inner(self) -> None:
+        from models import FastSAMTracker, HeavySAMRegistrar, _pick_best_fastsam_mask
+
+        cap = cv2.VideoCapture(self._video_path, cv2.CAP_MSMF)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(self._video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_idx)
+        ret, frame_bgr = cap.read()
+        cap.release()
+        if not ret:
+            return
+
+        self.progress.emit("Loading FastSAM for preview…")
+        fast_sam = FastSAMTracker(
+            weights=self._fastsam_weights or "FastSAM-x.pt",
+            device="cuda",
+        )
+        fast_sam.load(skip_compile=True)
+
+        self.progress.emit("Running FastSAM…")
+        masks_cuda, _ = fast_sam.predict_roi(frame_bgr, self._bbox)
+        fast_sam.unload()
+
+        if not masks_cuda:
+            self.preview_error.emit("no_masks")
+            return
+
+        pos_pts = [(x, y) for x, y, l in self._points if l == 1]
+        neg_pts = [(x, y) for x, y, l in self._points if l == 0]
+        best_mask_cuda = _pick_best_fastsam_mask(masks_cuda, self._bbox, pos_pts, neg_pts)
+        best_mask_np   = (best_mask_cuda > 0.5).cpu().numpy().astype(np.uint8)
+
+        if pos_pts:
+            best_mask_np = HeavySAMRegistrar._isolate_clicked_component(
+                best_mask_np.astype(bool), frame_bgr, self._points, self._separator_thresh
+            ).astype(np.uint8)
+
+        ys, xs = np.where(best_mask_np > 0)
+        if len(xs) == 0:
+            x1, y1, x2, y2 = (int(v) for v in self._bbox)
+            bbox_xywh = (x1, y1, x2 - x1, y2 - y1)
+        else:
+            bx1, by1 = int(xs.min()), int(ys.min())
+            bx2, by2 = int(xs.max()) + 1, int(ys.max()) + 1
+            bbox_xywh = (bx1, by1, bx2 - bx1, by2 - by1)
+
+        self.preview_ready.emit(best_mask_np * 255, bbox_xywh)
+
+
+# ---------------------------------------------------------------------------
 # RegistrationThread
 # ---------------------------------------------------------------------------
 
@@ -881,16 +972,20 @@ class RegistrationThread(QThread):
         fastsam_weights: str,
         reid_weights: str,
         separator_thresh: int = 40,
+        precomputed_mask: Optional[np.ndarray] = None,
+        precomputed_bbox: Optional[tuple] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self._video_path      = video_path
-        self._frame_idx       = frame_idx
-        self._bbox            = bbox          # (x1, y1, x2, y2) drawn by user
-        self._points          = list(points)  # [(x, y, label), ...]
-        self._fastsam_weights = fastsam_weights
-        self._reid_weights    = reid_weights
+        self._video_path       = video_path
+        self._frame_idx        = frame_idx
+        self._bbox             = bbox          # (x1, y1, x2, y2) drawn by user
+        self._points           = list(points)  # [(x, y, label), ...]
+        self._fastsam_weights  = fastsam_weights
+        self._reid_weights     = reid_weights
         self._separator_thresh = separator_thresh
+        self._precomputed_mask = precomputed_mask   # H×W uint8 *255, from MaskPreviewThread
+        self._precomputed_bbox = precomputed_bbox   # (x, y, w, h)
 
     def run(self) -> None:
         import torch
@@ -929,46 +1024,50 @@ class RegistrationThread(QThread):
             self.error.emit(f"Could not read frame {self._frame_idx}.")
             return
 
-        # ── FastSAM registration ─────────────────────────────────────
-        self.progress.emit("Loading FastSAM…")
-        fast_sam = FastSAMTracker(
-            weights=self._fastsam_weights or "FastSAM-s.pt",
-            device="cuda",
-        )
-        fast_sam.load(progress_cb=self.progress.emit, skip_compile=True)
-
-        self.progress.emit("Running FastSAM segmentation…")
-        masks_cuda, _ = fast_sam.predict_roi(frame_bgr, self._bbox)
-
-        if not masks_cuda:
-            self.error.emit(
-                "FastSAM found no masks inside the drawn bounding box.\n"
-                "Try drawing a larger box or adjusting FastSAM weights."
-            )
-            fast_sam.unload()
-            return
-
-        pos_pts = [(x, y) for x, y, l in self._points if l == 1]
-        neg_pts = [(x, y) for x, y, l in self._points if l == 0]
-        best_mask_cuda = _pick_best_fastsam_mask(masks_cuda, self._bbox, pos_pts, neg_pts)
-        best_mask_np   = (best_mask_cuda > 0.5).cpu().numpy().astype(np.uint8)
-
-        # Isolate the connected component at the positive click (separator-aware)
-        if pos_pts:
-            best_mask_np = HeavySAMRegistrar._isolate_clicked_component(
-                best_mask_np.astype(bool), frame_bgr, self._points, self._separator_thresh
-            ).astype(np.uint8)
-
-        ys, xs = np.where(best_mask_np > 0)
-        if len(xs) == 0:
-            x1, y1, x2, y2 = (int(v) for v in self._bbox)
-            bbox_xywh = (x1, y1, x2 - x1, y2 - y1)
+        # ── FastSAM registration (skipped when live preview already ran) ─
+        if self._precomputed_mask is not None and self._precomputed_bbox is not None:
+            self.progress.emit("Using live-preview mask (skipping FastSAM)…")
+            best_mask_np = (self._precomputed_mask > 0).astype(np.uint8)
+            bbox_xywh    = self._precomputed_bbox
         else:
-            bx1, by1 = int(xs.min()), int(ys.min())
-            bx2, by2 = int(xs.max()) + 1, int(ys.max()) + 1
-            bbox_xywh = (bx1, by1, bx2 - bx1, by2 - by1)
+            self.progress.emit("Loading FastSAM…")
+            fast_sam = FastSAMTracker(
+                weights=self._fastsam_weights or "FastSAM-x.pt",
+                device="cuda",
+            )
+            fast_sam.load(progress_cb=self.progress.emit, skip_compile=True)
 
-        fast_sam.unload()
+            self.progress.emit("Running FastSAM segmentation…")
+            masks_cuda, _ = fast_sam.predict_roi(frame_bgr, self._bbox)
+
+            if not masks_cuda:
+                self.error.emit(
+                    "FastSAM found no masks inside the drawn bounding box.\n"
+                    "Try drawing a larger box or adjusting FastSAM weights."
+                )
+                fast_sam.unload()
+                return
+
+            pos_pts = [(x, y) for x, y, l in self._points if l == 1]
+            neg_pts = [(x, y) for x, y, l in self._points if l == 0]
+            best_mask_cuda = _pick_best_fastsam_mask(masks_cuda, self._bbox, pos_pts, neg_pts)
+            best_mask_np   = (best_mask_cuda > 0.5).cpu().numpy().astype(np.uint8)
+
+            if pos_pts:
+                best_mask_np = HeavySAMRegistrar._isolate_clicked_component(
+                    best_mask_np.astype(bool), frame_bgr, self._points, self._separator_thresh
+                ).astype(np.uint8)
+
+            ys, xs = np.where(best_mask_np > 0)
+            if len(xs) == 0:
+                x1, y1, x2, y2 = (int(v) for v in self._bbox)
+                bbox_xywh = (x1, y1, x2 - x1, y2 - y1)
+            else:
+                bx1, by1 = int(xs.min()), int(ys.min())
+                bx2, by2 = int(xs.max()) + 1, int(ys.max()) + 1
+                bbox_xywh = (bx1, by1, bx2 - bx1, by2 - by1)
+
+            fast_sam.unload()
 
         # ── Re-ID embedding ──────────────────────────────────────────
         self.progress.emit("Extracting reference embedding…")
@@ -1311,10 +1410,20 @@ class MainWindow(QMainWindow):
         self._reg_result:   Optional[dict] = None
 
         # Worker references
-        self._reg_thread:    Optional[RegistrationThread]  = None
-        self._reader_thread: Optional[VideoReaderThread]   = None
-        self._display_worker: Optional[FrameDisplayWorker] = None
-        self._gpu_process    = None    # GPUPipelineProcess (imported lazily)
+        self._reg_thread:     Optional[RegistrationThread]  = None
+        self._preview_thread: Optional[MaskPreviewThread]   = None
+        self._reader_thread:  Optional[VideoReaderThread]   = None
+        self._display_worker: Optional[FrameDisplayWorker]  = None
+        self._gpu_process     = None    # GPUPipelineProcess (imported lazily)
+
+        # Live mask preview state (populated by MaskPreviewThread)
+        self._live_mask:      Optional[np.ndarray] = None
+        self._live_bbox_xywh: Optional[tuple]      = None
+
+        # Debounce timer — fires 400 ms after the last bbox/point change
+        self._preview_debounce = QTimer()
+        self._preview_debounce.setSingleShot(True)
+        self._preview_debounce.timeout.connect(self._run_mask_preview)
 
         # FPS tracking (display side)
         self._fps_history: list[float] = []
@@ -1470,19 +1579,80 @@ class MainWindow(QMainWindow):
         n_neg = sum(1 for _, _, l in self.canvas.get_prompt_points() if l == 0)
         self._status_bar.showMessage(
             f"Refinement points: {n_pos} positive, {n_neg} negative  ·  "
-            "Click 'Register Target' when ready."
+            "Computing mask preview…"
         )
+        self._preview_debounce.start(400)
 
     def _on_clear_points(self) -> None:
+        self._preview_debounce.stop()
+        if self._preview_thread and self._preview_thread.isRunning():
+            self._preview_thread.quit()
+            self._preview_thread.wait(500)
+        self._live_mask = None
+        self._live_bbox_xywh = None
         self.canvas.clear_prompts()
         self._status_bar.showMessage("Cleared. Draw a new bounding box to start over.")
 
     def _on_bbox_drawn(self, x1: float, y1: float, x2: float, y2: float) -> None:
         w, h = int(x2 - x1), int(y2 - y1)
         self._status_bar.showMessage(
-            f"Bbox drawn ({w}×{h} px)  ·  "
-            "Optionally left/right click to add +/− points, then Register."
+            f"Bbox drawn ({w}×{h} px)  ·  Computing mask preview…"
         )
+        self._live_mask = None
+        self._live_bbox_xywh = None
+        self._preview_debounce.start(400)
+
+    # ------------------------------------------------------------------
+    # Live mask preview (MaskPreviewThread)
+    # ------------------------------------------------------------------
+
+    def _run_mask_preview(self) -> None:
+        """Fired by debounce timer — cancel any running preview, start a new one."""
+        if not self._video_path:
+            return
+        bbox = self.canvas.get_reg_bbox()
+        if bbox is None:
+            return
+
+        if self._preview_thread and self._preview_thread.isRunning():
+            self._preview_thread.quit()
+            self._preview_thread.wait(500)
+
+        self._preview_thread = MaskPreviewThread(
+            video_path       = self._video_path,
+            frame_idx        = self._current_frame_idx,
+            bbox             = bbox,
+            points           = self.canvas.get_prompt_points(),
+            fastsam_weights  = self.control.get_fastsam_weights(),
+            separator_thresh = self.control.get_separator_thresh(),
+            parent           = self,
+        )
+        self._preview_thread.preview_ready.connect(self._on_mask_preview_ready)
+        self._preview_thread.preview_error.connect(self._on_mask_preview_error)
+        self._preview_thread.progress.connect(
+            lambda msg: self._status_bar.showMessage(msg)
+        )
+        self._preview_thread.start()
+
+    def _on_mask_preview_ready(self, mask: np.ndarray, bbox_xywh: tuple) -> None:
+        self._live_mask      = mask
+        self._live_bbox_xywh = bbox_xywh
+        self.canvas.set_mask_overlay(mask)
+        pts = self.canvas.get_prompt_points()
+        n_pos = sum(1 for _, _, l in pts if l == 1)
+        n_neg = sum(1 for _, _, l in pts if l == 0)
+        pt_str = f"  ·  {n_pos}+ {n_neg}− pts" if pts else ""
+        self._status_bar.showMessage(
+            f"Mask preview ready{pt_str}  ·  Click 'Register Target' to embed."
+        )
+
+    def _on_mask_preview_error(self, msg: str) -> None:
+        if msg == "no_masks":
+            self._status_bar.showMessage(
+                "FastSAM found no mask in that region — try a larger bounding box."
+            )
+        else:
+            self._status_bar.showMessage("Mask preview failed — check FastSAM weights.")
 
     # ------------------------------------------------------------------
     # Slot: Register Target
@@ -1507,14 +1677,16 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage("Registering target — please wait…")
 
         self._reg_thread = RegistrationThread(
-            video_path       = self._video_path,
-            frame_idx        = self._current_frame_idx,
-            bbox             = bbox,
-            points           = points,
-            fastsam_weights  = self.control.get_fastsam_weights(),
-            reid_weights     = self.control.get_reid_weights(),
-            separator_thresh = self.control.get_separator_thresh(),
-            parent           = self,
+            video_path        = self._video_path,
+            frame_idx         = self._current_frame_idx,
+            bbox              = bbox,
+            points            = points,
+            fastsam_weights   = self.control.get_fastsam_weights(),
+            reid_weights      = self.control.get_reid_weights(),
+            separator_thresh  = self.control.get_separator_thresh(),
+            precomputed_mask  = self._live_mask,
+            precomputed_bbox  = self._live_bbox_xywh,
+            parent            = self,
         )
         self._reg_thread.registration_done.connect(self._on_registration_done)
         self._reg_thread.progress.connect(self._on_registration_progress)
@@ -1598,6 +1770,12 @@ class MainWindow(QMainWindow):
         self.control.set_tracking_active(False)
         self.timeline.set_playing(False)
         self._status_bar.showMessage("Tracking stopped.")
+
+        # Seek back to the beginning so the user can restart from frame 0
+        self._current_frame_idx = 0
+        self.timeline.update_position(0)
+        if self._reader_thread and self._reader_thread.isRunning():
+            self._reader_thread.seek(0)
 
     # ------------------------------------------------------------------
     # Slot: Export
@@ -1753,7 +1931,7 @@ class MainWindow(QMainWindow):
             "ema_alpha":       0.90,
             "overlay_alpha":   self.control.get_alpha(),
             "stride":          self.control.get_stride(),
-            "fastsam_weights": self.control.get_fastsam_weights() or "FastSAM-s.pt",
+            "fastsam_weights": self.control.get_fastsam_weights() or "FastSAM-x.pt",
             "reid_weights":    self.control.get_reid_weights() or None,
             "batch_render":    batch_render,
             "output_path":     output_path,
@@ -1818,6 +1996,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         """Graceful shutdown: drain threads, terminate GPU process."""
         self._watchdog.stop()
+        self._preview_debounce.stop()
+
+        # Stop live preview thread
+        if self._preview_thread and self._preview_thread.isRunning():
+            self._preview_thread.quit()
+            self._preview_thread.wait(1000)
 
         # Stop reader
         if self._reader_thread and self._reader_thread.isRunning():

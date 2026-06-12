@@ -168,8 +168,13 @@ def split_masks_by_separators(
 
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     sep  = (gray <= int(sep_thresh)).astype(np.uint8)   # 1 where separator/black
+    kernel = np.ones((3, 3), np.uint8)
+    # Close before dilating: fills isolated bright pixels that interrupt the
+    # separator line in noisy/compressed video.  Without this, a single missed
+    # row in the separator leaves a horizontal bridge that connectedComponents
+    # always finds, regardless of connectivity setting.
+    sep = cv2.morphologyEx(sep, cv2.MORPH_CLOSE, kernel)
     if dilate > 0:
-        kernel = np.ones((3, 3), np.uint8)
         sep = cv2.dilate(sep, kernel, iterations=int(dilate))
 
     out_masks:  list = []
@@ -180,8 +185,11 @@ def split_masks_by_separators(
         m_np = (m_cuda > 0.5).to("cpu", torch.uint8).numpy()
         m_np[sep == 1] = 0
 
+        # connectivity=4: diagonal adjacency does NOT count as connected.
+        # With connectivity=8 a thin separator leaves diagonal corners that
+        # bridge the two objects; connectivity=4 prevents that entirely.
         n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            m_np, connectivity=8
+            m_np, connectivity=4
         )
 
         # Label 0 is background; keep foreground components above min_area.
@@ -477,18 +485,27 @@ class InferThread(threading.Thread):
 
         emb_batch = self._embedder.embed_batch(crops)  # np.float32 [N, D]
 
-        # ── 4. Gallery cosine match ───────────────────────────────────
-        best_idx, sim = self._gallery.best_match(emb_batch)
-        sim = float(sim)
-        threshold = float(self._cfg.get("match_threshold", 0.85))
-        accepted = sim >= threshold
+        # ── 4. Gallery cosine match (all candidates above threshold) ──
+        accepted_idxs, accepted_sims, best_idx, sim = \
+            self._gallery.all_matches_above_threshold(emb_batch)
+        accepted = len(accepted_idxs) > 0
 
         # ── 5. Accept / reject ───────────────────────────────────────
         if accepted and masks_cuda is not None and best_idx < len(masks_cuda):
-            best_mask  = masks_cuda[best_idx]   # float32 H×W CUDA
+            # Combine every accepted mask into one overlay so all matching
+            # objects are highlighted simultaneously.
+            valid_idxs = [i for i in accepted_idxs if i < len(masks_cuda)]
+            if len(valid_idxs) > 1:
+                best_mask = torch.stack(
+                    [masks_cuda[i] for i in valid_idxs]
+                ).max(dim=0).values   # logical OR across accepted masks
+            else:
+                best_mask = masks_cuda[valid_idxs[0]]
+
             best_bbox  = bboxes_xyxy[best_idx]
             self._gallery.update(emb_batch[best_idx], sim)
-            # Convert xyxy → xywh for tracker re-init
+            # Re-seed tracker on the single highest-scoring object only,
+            # so the ROI crop stays focused on the primary target.
             x1b, y1b, x2b, y2b = (int(v) for v in best_bbox)
             self._tracker.init(frame_bgr_np, (x1b, y1b, x2b - x1b, y2b - y1b))
             self._last_mask_cuda  = best_mask
@@ -722,7 +739,7 @@ class GPUPipelineProcess(mp.Process):
         "ema_alpha":       0.90,
         "overlay_alpha":   0.50,
         "stride":          1,
-        "fastsam_weights": "FastSAM-s.pt",
+        "fastsam_weights": "FastSAM-x.pt",
         "reid_weights":    None,
         "batch_render":    False,
         "output_path":     "",

@@ -324,12 +324,14 @@ class HeavySAMRegistrar:
 
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         sep  = (gray <= int(separator_thresh)).astype(np.uint8)
-        sep  = cv2.dilate(sep, np.ones((3, 3), np.uint8), iterations=1)
+        kernel = np.ones((3, 3), np.uint8)
+        sep  = cv2.morphologyEx(sep, cv2.MORPH_CLOSE, kernel)
+        sep  = cv2.dilate(sep, kernel, iterations=1)
 
         cut = mask_bool.astype(np.uint8)
         cut[sep == 1] = 0
 
-        n_labels, labels = cv2.connectedComponents(cut, connectivity=8)
+        n_labels, labels = cv2.connectedComponents(cut, connectivity=4)
         if n_labels <= 2:
             # 0 = background, 1 = single object → nothing merged to split.
             return mask_bool
@@ -413,7 +415,7 @@ class FastSAMTracker:
 
     def __init__(
         self,
-        weights: str = "FastSAM-s.pt",
+        weights: str = "FastSAM-x.pt",
         device:  str = "cuda",
     ) -> None:
         self._weights = weights
@@ -969,6 +971,29 @@ class EMAGallery:
             sims = emb_batch @ self._v_ref   # [N]  dot products
         best_idx = int(np.argmax(sims))
         return best_idx, float(sims[best_idx])
+
+    def all_matches_above_threshold(
+        self, emb_batch: np.ndarray
+    ) -> tuple[list[int], list[float], int, float]:
+        """
+        Return every candidate whose similarity meets match_threshold, plus the
+        single best index/score for tracker re-seeding.
+
+        Returns
+        -------
+        accepted_idxs : list[int]   indices into emb_batch that pass the gate
+        accepted_sims : list[float] corresponding similarity scores
+        best_idx      : int         index of the highest-scoring candidate
+        best_sim      : float       its similarity score
+        """
+        with self._lock:
+            sims  = emb_batch @ self._v_ref   # [N]
+            thresh = self._match_threshold
+        best_idx = int(np.argmax(sims))
+        best_sim = float(sims[best_idx])
+        accepted_idxs = [i for i in range(len(sims)) if float(sims[i]) >= thresh]
+        accepted_sims = [float(sims[i]) for i in accepted_idxs]
+        return accepted_idxs, accepted_sims, best_idx, best_sim
 
     def is_match(self, emb: np.ndarray) -> tuple[bool, float]:
         """
