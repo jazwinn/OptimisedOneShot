@@ -121,10 +121,17 @@ def _union_bboxes_padded(
     )
 
 
-def _crop_bgr(frame_bgr: np.ndarray, bbox_xyxy: tuple) -> Optional[np.ndarray]:
+def _crop_bgr(
+    frame_bgr: np.ndarray,
+    bbox_xyxy: tuple,
+    mask_cuda=None,
+) -> Optional[np.ndarray]:
     """
-    Crop frame_bgr to the given xyxy bounding box, clamped to frame
-    dimensions.  Returns None if the resulting region has zero area.
+    Crop frame_bgr to bbox_xyxy.  If mask_cuda is given, pixels outside the
+    mask are filled with the mean colour of the masked pixels so the Re-ID
+    embedding sees the object shape without being anchored to the background
+    colour (black backgrounds bias cosine similarity toward dark embeddings).
+    Returns None when the crop has zero area.
     """
     x1, y1, x2, y2 = (int(v) for v in bbox_xyxy)
     fh, fw = frame_bgr.shape[:2]
@@ -132,7 +139,14 @@ def _crop_bgr(frame_bgr: np.ndarray, bbox_xyxy: tuple) -> Optional[np.ndarray]:
     x2 = min(fw, x2); y2 = min(fh, y2)
     if x2 <= x1 or y2 <= y1:
         return None
-    return frame_bgr[y1:y2, x1:x2]
+    crop = frame_bgr[y1:y2, x1:x2].copy()
+    if mask_cuda is not None:
+        import torch
+        m = (mask_cuda[y1:y2, x1:x2] > 0.5).cpu().numpy()
+        if m.any():
+            mean_col = crop[m].mean(axis=0).astype(np.uint8)
+            crop[~m] = mean_col
+    return crop
 
 
 def _bbox_to_mask_cuda(bbox_xyxy: tuple, H: int, W: int):
@@ -158,7 +172,7 @@ def split_masks_by_separators(
     *,
     sep_thresh:  int,
     min_area:    int,
-    dilate:      int = 1,
+    dilate:      int = 2,
 ) -> tuple[list, list]:
     """
     Split merged FastSAM masks along near-black separator lines.
@@ -563,12 +577,35 @@ class InferThread(threading.Thread):
                 min_area   = self._min_component_area,
             )
 
+        # ── 2c. Reject background-scale masks ────────────────────────
+        # Masks covering more than 55% of the frame are overwhelmingly likely
+        # to be the background or the whole scene — not an individual object.
+        # Keeping them pollutes Re-ID: a black-background mask embeds similarly
+        # to any registration crop that had black fill for non-polygon pixels.
+        max_mask_pixels = int(H * W * 0.55)
+        if masks_cuda:
+            filtered = [
+                (m, b) for m, b in zip(masks_cuda, bboxes_xyxy)
+                if int((m > 0.5).sum().item()) <= max_mask_pixels
+            ]
+            if filtered:
+                masks_cuda, bboxes_xyxy = zip(*filtered)
+                masks_cuda  = list(masks_cuda)
+                bboxes_xyxy = list(bboxes_xyxy)
+            else:
+                masks_cuda, bboxes_xyxy = [], []
+
         # ── 3. Batch Re-ID embed ──────────────────────────────────────
         if not bboxes_xyxy:
             self._no_match_streak += 1
             return (idx, frame_cuda, self._last_mask_cuda, bbox_xyxy, False, 0.0, "no_candidates")
 
-        crops = [_crop_bgr(frame_bgr_np, b) for b in bboxes_xyxy]
+        # Pass the corresponding mask so non-object pixels in each crop are
+        # filled with the object's mean colour instead of the background colour.
+        crops = [
+            _crop_bgr(frame_bgr_np, b, m)
+            for b, m in zip(bboxes_xyxy, masks_cuda)
+        ]
         crops = [c for c in crops if c is not None and c.size > 0]
         if not crops:
             self._no_match_streak += 1

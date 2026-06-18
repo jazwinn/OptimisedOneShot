@@ -1151,11 +1151,16 @@ class RegistrationThread(QThread):
             y1 = max(0, qy)
             x2 = min(fw, qx + qw)
             y2 = min(fh, qy + qh)
-            crop_full = frame_bgr.copy()
             poly_mask = np.zeros((fh, fw), dtype=np.uint8)
             cv2.fillPoly(poly_mask, [quad], 255)
-            crop_full[poly_mask == 0] = 0   # black out non-polygon pixels
-            crop = crop_full[y1:y2, x1:x2]
+            crop_roi    = frame_bgr[y1:y2, x1:x2].copy()
+            mask_roi    = poly_mask[y1:y2, x1:x2].astype(bool)
+            # Fill non-polygon pixels with the mean object colour so the Re-ID
+            # embedding is not biased toward black (which the background shares).
+            if mask_roi.any():
+                mean_col = crop_roi[mask_roi].mean(axis=0).astype(np.uint8)
+                crop_roi[~mask_roi] = mean_col
+            crop = crop_roi
         else:
             x, y, w, h = bbox_xywh
             x1 = max(0, int(x))
