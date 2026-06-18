@@ -1550,6 +1550,8 @@ class MainWindow(QMainWindow):
         self._video_fps:    float          = 30.0
         self._vid_w:        int            = 1280
         self._vid_h:        int            = 720
+        self._native_w:     int            = 1280   # original video dimensions before downscale
+        self._native_h:     int            = 720
         self._current_frame_idx: int       = 0
         self._reg_result:   Optional[dict] = None
 
@@ -1665,6 +1667,8 @@ class MainWindow(QMainWindow):
 
         native_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         native_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._native_w = native_w
+        self._native_h = native_h
         self._video_fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
         self._total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -2115,6 +2119,8 @@ class MainWindow(QMainWindow):
             "separator_split":  self.control.get_separator_split(),
             "separator_thresh": self.control.get_separator_thresh(),
             "detection_mode":   self.control.get_detection_mode(),
+            "native_w":         self._native_w,
+            "native_h":         self._native_h,
         }
 
         self._gpu_process = GPUPipelineProcess(

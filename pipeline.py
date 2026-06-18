@@ -704,6 +704,9 @@ class BlendThread(threading.Thread):
         video_writer      = None,
         total_frames:     int = 0,
         batch_render:     bool = False,
+        native_h:         int = 0,
+        native_w:         int = 0,
+        video_path:       str = "",
     ) -> None:
         super().__init__(daemon=True, name="BlendThread")
         self._in_q        = infer_to_blend_q
@@ -717,10 +720,27 @@ class BlendThread(threading.Thread):
         self._batch       = batch_render
         self._frame_count = 0
         self._stream      = None   # created in run() after CUDA context exists
+        # Native-resolution export: read raw frames here and composite at full res.
+        self._native_h    = native_h if native_h > 0 else vid_h
+        self._native_w    = native_w if native_w > 0 else vid_w
+        self._video_path  = video_path
+        self._native_cap  = None   # cv2.VideoCapture, opened in run() if exporting
 
     def run(self) -> None:
         import torch
         self._stream = torch.cuda.Stream()
+
+        # For native-resolution export: open a separate capture that reads at
+        # full resolution while inference runs on the downscaled stream.
+        needs_native = (
+            self._batch
+            and self._video_path
+            and (self._native_h != self._H or self._native_w != self._W)
+        )
+        if needs_native:
+            self._native_cap = cv2.VideoCapture(self._video_path, cv2.CAP_MSMF)
+            if not self._native_cap.isOpened():
+                self._native_cap = cv2.VideoCapture(self._video_path)
 
         while not self._stop.is_set():
             try:
@@ -730,6 +750,9 @@ class BlendThread(threading.Thread):
 
             if item is None:
                 # Pipeline drained — notify display and exit.
+                if self._native_cap is not None:
+                    self._native_cap.release()
+                    self._native_cap = None
                 self._send_sentinel()
                 return
 
@@ -747,6 +770,9 @@ class BlendThread(threading.Thread):
             self._frame_count += 1
 
         # stop_event was set externally.
+        if self._native_cap is not None:
+            self._native_cap.release()
+            self._native_cap = None
         self._send_sentinel()
 
     def _send_sentinel(self) -> None:
@@ -838,17 +864,66 @@ class BlendThread(threading.Thread):
         except queue.Full:
             pass
 
-        # ── Batch render: write BGR frame to VideoWriter ──────────────
+        # ── Batch render: write frame to VideoWriter ─────────────────
         if self._writer is not None:
-            out_bgr_np = (
-                out_bgr_cuda
-                .mul(255.0)
-                .byte()
-                .permute(1, 2, 0)
-                .cpu()
-                .numpy()
-            )   # H×W×3 uint8 BGR
-            self._writer.write_frame(out_bgr_np)
+            if self._native_cap is not None:
+                # Seek to the exact frame index so native and inference streams
+                # stay in sync even when frames are dropped or export starts
+                # mid-video.
+                self._native_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret_n, native_bgr = self._native_cap.read()
+                if ret_n and native_bgr is not None:
+                    NH, NW = self._native_h, self._native_w
+                    if accepted and mask_cuda is not None:
+                        import torch.nn.functional as F
+                        # Upscale binary mask to native resolution (nearest so
+                        # hard edges stay sharp, no interpolation artefacts).
+                        mask_up = F.interpolate(
+                            (mask_cuda > 0.5).float().unsqueeze(0).unsqueeze(0),
+                            size=(NH, NW),
+                            mode="nearest",
+                        ).squeeze()  # NH×NW float32 CUDA
+                        # Build native CUDA frame for blending.
+                        native_rgb = cv2.cvtColor(native_bgr, cv2.COLOR_BGR2RGB)
+                        native_t = (
+                            torch.from_numpy(native_rgb)
+                            .to(mask_cuda.device)
+                            .float()
+                            .div(255.0)
+                            .permute(2, 0, 1)   # H×W×3 → 3×H×W
+                        )
+                        native_blended = _alpha_blend(native_t, mask_up, alpha)
+                        export_bgr_np = (
+                            native_blended[[2, 1, 0], :, :]   # RGB → BGR
+                            .mul(255.0)
+                            .byte()
+                            .permute(1, 2, 0)
+                            .contiguous()
+                            .cpu()
+                            .numpy()
+                            .copy()
+                        )
+                        # Draw polygon overlays on native frame too.
+                        mask_up_np = (mask_up > 0.5).byte().cpu().numpy().astype(np.uint8) * 255
+                        _draw_quad_overlays(export_bgr_np, mask_up_np)
+                        # _draw_quad_overlays works on RGB; we have BGR — swap channels.
+                        export_bgr_np = cv2.cvtColor(export_bgr_np, cv2.COLOR_RGB2BGR)
+                    else:
+                        export_bgr_np = native_bgr
+                    self._writer.write_frame(export_bgr_np)
+            else:
+                # Inference res == native res: write the already-composited frame.
+                out_bgr_np = (
+                    out_bgr_cuda
+                    .mul(255.0)
+                    .byte()
+                    .permute(1, 2, 0)
+                    .contiguous()
+                    .cpu()
+                    .numpy()
+                    .copy()
+                )
+                self._writer.write_frame(out_bgr_np)
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +971,8 @@ class GPUPipelineProcess(mp.Process):
         "separator_thresh":        40,
         "min_component_area_frac": 0.30,
         "detection_mode":          False,
+        "native_w":                0,   # 0 = same as vid_w (no upscale needed)
+        "native_h":                0,
     }
 
     def __init__(
@@ -999,10 +1076,12 @@ class GPUPipelineProcess(mp.Process):
         total_frames = 0
         if cfg["batch_render"] and cfg["output_path"]:
             from video_io import VideoWriter
+            export_w = cfg.get("native_w") or cfg["vid_w"]
+            export_h = cfg.get("native_h") or cfg["vid_h"]
             video_writer = VideoWriter(
                 output_path = cfg["output_path"],
-                width       = cfg["vid_w"],
-                height      = cfg["vid_h"],
+                width       = export_w,
+                height      = export_h,
                 fps         = cfg["video_fps"],
             )
             video_writer.open()
@@ -1060,6 +1139,9 @@ class GPUPipelineProcess(mp.Process):
             video_writer      = video_writer,
             total_frames      = total_frames,
             batch_render      = bool(cfg["batch_render"] and cfg["output_path"]),
+            native_h          = cfg.get("native_h", 0),
+            native_w          = cfg.get("native_w", 0),
+            video_path        = cfg.get("video_path", ""),
         )
 
         dec_t.start()
