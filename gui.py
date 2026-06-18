@@ -651,6 +651,12 @@ class ControlPanel(QWidget):
     erosion_split_toggled    = Signal(bool)  # erosion-based split on/off
     detection_mode_toggled = Signal(bool)  # skip tracker, full-frame detect every frame
     max_height_changed     = Signal(int)   # 0 = native, else max frame height
+    fastsam_conf_changed   = Signal(float) # FastSAM detection confidence 0.10–0.70
+    fastsam_iou_changed    = Signal(float) # FastSAM NMS IoU 0.50–0.95
+    ema_threshold_changed  = Signal(float) # EMA update gate 0.80–0.99
+    ema_alpha_changed      = Signal(float) # EMA momentum 0.70–0.99
+    area_ceiling_changed   = Signal(int)   # max mask area % 10–90
+    adaptive_stride_toggled = Signal(bool) # auto-throttle FastSAM on stable frames
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -715,6 +721,24 @@ class ControlPanel(QWidget):
 
     def get_erosion_split(self) -> bool:
         return self.erosion_check.isChecked()
+
+    def get_fastsam_conf(self) -> float:
+        return self.fastsam_conf_spin.value() / 100.0
+
+    def get_fastsam_iou(self) -> float:
+        return self.fastsam_iou_spin.value() / 100.0
+
+    def get_ema_threshold(self) -> float:
+        return self.ema_threshold_spin.value() / 100.0
+
+    def get_ema_alpha(self) -> float:
+        return self.ema_alpha_spin.value() / 100.0
+
+    def get_area_ceiling(self) -> int:
+        return self.area_ceiling_spin.value()
+
+    def get_adaptive_stride(self) -> bool:
+        return self.adaptive_stride_check.isChecked()
 
     # ------------------------------------------------------------------
     # Build UI
@@ -792,6 +816,121 @@ class ControlPanel(QWidget):
         )
         self.register_btn.clicked.connect(self.register_requested)
         root.addWidget(self.register_btn)
+
+        # ── Detection Parameters ──────────────────────────────────────
+        root.addWidget(self._make_separator("Detection Parameters"))
+
+        # FastSAM confidence
+        fc_row = QHBoxLayout()
+        fc_row.addWidget(QLabel("FastSAM Conf:"))
+        self.fastsam_conf_spin = QSpinBox()
+        self.fastsam_conf_spin.setRange(10, 70)
+        self.fastsam_conf_spin.setValue(35)
+        self.fastsam_conf_spin.setSuffix(" %")
+        self.fastsam_conf_spin.setToolTip(
+            "<b>FastSAM Detection Confidence (10–70%)</b><br>"
+            "Minimum confidence for FastSAM to output a mask candidate.<br>"
+            "Lower = more candidates (catches faint objects, but more noise).<br>"
+            "Higher = fewer, cleaner masks but may miss objects.<br>"
+            "Default 35% works well for most scenarios."
+        )
+        self.fastsam_conf_spin.valueChanged.connect(
+            lambda v: self.fastsam_conf_changed.emit(v / 100.0)
+        )
+        fc_row.addWidget(self.fastsam_conf_spin)
+        root.addLayout(fc_row)
+
+        # FastSAM NMS IoU
+        fi_row = QHBoxLayout()
+        fi_row.addWidget(QLabel("FastSAM IoU NMS:"))
+        self.fastsam_iou_spin = QSpinBox()
+        self.fastsam_iou_spin.setRange(50, 95)
+        self.fastsam_iou_spin.setValue(90)
+        self.fastsam_iou_spin.setSuffix(" %")
+        self.fastsam_iou_spin.setToolTip(
+            "<b>FastSAM NMS IoU Threshold (50–95%)</b><br>"
+            "Controls how aggressively overlapping mask candidates are suppressed.<br>"
+            "High IoU (90%) suppresses nearly all overlapping masks — fast but may<br>"
+            "discard valid adjacent objects before Re-ID can evaluate them.<br>"
+            "Lower IoU (60–75%) keeps more overlapping candidates for Re-ID to judge.<br>"
+            "Reduce this if two nearby objects are always merged into one mask."
+        )
+        self.fastsam_iou_spin.valueChanged.connect(
+            lambda v: self.fastsam_iou_changed.emit(v / 100.0)
+        )
+        fi_row.addWidget(self.fastsam_iou_spin)
+        root.addLayout(fi_row)
+
+        # EMA update gate
+        et_row = QHBoxLayout()
+        et_row.addWidget(QLabel("EMA Update Gate:"))
+        self.ema_threshold_spin = QSpinBox()
+        self.ema_threshold_spin.setRange(80, 99)
+        self.ema_threshold_spin.setValue(92)
+        self.ema_threshold_spin.setSuffix(" %")
+        self.ema_threshold_spin.setToolTip(
+            "<b>EMA Update Gate (80–99%)</b><br>"
+            "The reference embedding only updates when the frame similarity exceeds<br>"
+            "this threshold. Higher = stricter; the gallery drifts less but may not<br>"
+            "adapt to lighting changes. Lower = adapts faster but risks drifting<br>"
+            "toward non-target objects in confusing scenes."
+        )
+        self.ema_threshold_spin.valueChanged.connect(
+            lambda v: self.ema_threshold_changed.emit(v / 100.0)
+        )
+        et_row.addWidget(self.ema_threshold_spin)
+        root.addLayout(et_row)
+
+        # EMA momentum
+        ea_row = QHBoxLayout()
+        ea_row.addWidget(QLabel("EMA Momentum:"))
+        self.ema_alpha_spin = QSpinBox()
+        self.ema_alpha_spin.setRange(70, 99)
+        self.ema_alpha_spin.setValue(90)
+        self.ema_alpha_spin.setSuffix(" %")
+        self.ema_alpha_spin.setToolTip(
+            "<b>EMA Momentum / Alpha (70–99%)</b><br>"
+            "How strongly the existing reference is retained on each update.<br>"
+            "High alpha (90%) = slow drift; reference barely moves per frame.<br>"
+            "Low alpha (70%) = fast adaptation; reference tracks appearance<br>"
+            "changes quickly but is more vulnerable to a single bad match."
+        )
+        self.ema_alpha_spin.valueChanged.connect(
+            lambda v: self.ema_alpha_changed.emit(v / 100.0)
+        )
+        ea_row.addWidget(self.ema_alpha_spin)
+        root.addLayout(ea_row)
+
+        # Area ceiling
+        ac_row = QHBoxLayout()
+        ac_row.addWidget(QLabel("Max Mask Area:"))
+        self.area_ceiling_spin = QSpinBox()
+        self.area_ceiling_spin.setRange(10, 90)
+        self.area_ceiling_spin.setValue(55)
+        self.area_ceiling_spin.setSuffix(" %")
+        self.area_ceiling_spin.setToolTip(
+            "<b>Max Mask Area % (10–90%)</b><br>"
+            "Reject any FastSAM mask that covers more than this fraction of the frame.<br>"
+            "Background/scene-wide masks embed similarly to any dark registration crop<br>"
+            "and would create false matches. Raise if you are tracking very large objects<br>"
+            "(e.g. a full-height vehicle close to the camera)."
+        )
+        self.area_ceiling_spin.valueChanged.connect(self.area_ceiling_changed)
+        ac_row.addWidget(self.area_ceiling_spin)
+        root.addLayout(ac_row)
+
+        # Adaptive stride toggle
+        self.adaptive_stride_check = QCheckBox("Adaptive Stride")
+        self.adaptive_stride_check.setChecked(False)
+        self.adaptive_stride_check.setToolTip(
+            "<b>Adaptive Stride</b><br>"
+            "Automatically increases the inference stride to ×2 when tracker confidence<br>"
+            "and Re-ID similarity are both high, skipping FastSAM on redundant frames<br>"
+            "to save GPU time. Reverts to the manual stride setting when either<br>"
+            "metric drops below its threshold. Turn off for fully predictable timing."
+        )
+        self.adaptive_stride_check.toggled.connect(self.adaptive_stride_toggled)
+        root.addWidget(self.adaptive_stride_check)
 
         # ── Tracking Parameters ───────────────────────────────────────
         root.addWidget(self._make_separator("Tracking Parameters"))
@@ -971,6 +1110,7 @@ class ControlPanel(QWidget):
         )
         self.erosion_check.toggled.connect(self.erosion_split_toggled)
         root.addWidget(self.erosion_check)
+
 
         # ── Execution ─────────────────────────────────────────────────
         root.addWidget(self._make_separator("Execution"))
@@ -1475,11 +1615,11 @@ class VideoReaderThread(QThread):
                 elif cmd.type == "STOP_TRACKING":
                     tracking = False
                     batch = False
-                    # Signal GPU process to stop consuming
-                    try:
-                        self._raw_frame_queue.put_nowait(None)
-                    except Exception:
-                        pass
+                    # Do NOT put None here — the GPU process is stopped via
+                    # pipeline_cmd_queue.STOP + terminate in _on_stop_tracking.
+                    # Putting None here races with _launch_gpu_process's queue
+                    # drain on restart, causing the new GPU process to exit
+                    # immediately when it reads the stale sentinel.
 
             # ── PLAYING: emit preview frames at video FPS ────────────
             if playing:
@@ -1731,6 +1871,12 @@ class MainWindow(QMainWindow):
         cp.proj_valley_thresh_changed.connect(self._on_proj_valley_thresh_changed)
         cp.erosion_split_toggled.connect(self._on_erosion_split_toggled)
         cp.detection_mode_toggled.connect(self._on_detection_mode_toggled)
+        cp.fastsam_conf_changed.connect(self._on_fastsam_conf_changed)
+        cp.fastsam_iou_changed.connect(self._on_fastsam_iou_changed)
+        cp.ema_threshold_changed.connect(self._on_ema_threshold_changed)
+        cp.ema_alpha_changed.connect(self._on_ema_alpha_changed)
+        cp.area_ceiling_changed.connect(self._on_area_ceiling_changed)
+        cp.adaptive_stride_toggled.connect(self._on_adaptive_stride_toggled)
 
         # Timeline → MainWindow
         tl.seek_requested.connect(self._on_seek)
@@ -1993,9 +2139,10 @@ class MainWindow(QMainWindow):
         self._launch_gpu_process()
         self._launch_display_worker()
 
-        # Tell the reader thread to start feeding raw_frame_queue
-        if self._reader_thread and self._reader_thread.isRunning():
-            self._reader_thread.start_tracking(self._current_frame_idx)
+        # Ensure reader thread is alive before telling it to feed frames.
+        if not (self._reader_thread and self._reader_thread.isRunning()):
+            self._start_reader_thread()
+        self._reader_thread.start_tracking(self._current_frame_idx)
 
         self.control.set_tracking_active(True)
         self.timeline.set_playing(True)
@@ -2033,11 +2180,13 @@ class MainWindow(QMainWindow):
         self.timeline.set_playing(False)
         self._status_bar.showMessage("Tracking stopped.")
 
-        # Seek back to the beginning so the user can restart from frame 0
+        # Reset to frame 0 and repaint the canvas with the raw first frame so
+        # the user doesn't see the last tracked frame when they restart.
         self._current_frame_idx = 0
         self.timeline.update_position(0)
         if self._reader_thread and self._reader_thread.isRunning():
             self._reader_thread.seek(0)
+        self._show_video_frame(0)
 
     # ------------------------------------------------------------------
     # Slot: Export
@@ -2103,6 +2252,24 @@ class MainWindow(QMainWindow):
 
     def _on_detection_mode_toggled(self, enabled: bool) -> None:
         self._send_pipeline_cmd("UPDATE_DETECTION_MODE", enabled)
+
+    def _on_fastsam_conf_changed(self, value: float) -> None:
+        self._send_pipeline_cmd("UPDATE_FASTSAM_CONF", value)
+
+    def _on_fastsam_iou_changed(self, value: float) -> None:
+        self._send_pipeline_cmd("UPDATE_FASTSAM_IOU", value)
+
+    def _on_ema_threshold_changed(self, value: float) -> None:
+        self._send_pipeline_cmd("UPDATE_EMA_THRESHOLD", value)
+
+    def _on_ema_alpha_changed(self, value: float) -> None:
+        self._send_pipeline_cmd("UPDATE_EMA_ALPHA", value)
+
+    def _on_area_ceiling_changed(self, value: int) -> None:
+        self._send_pipeline_cmd("UPDATE_AREA_CEILING", value)
+
+    def _on_adaptive_stride_toggled(self, enabled: bool) -> None:
+        self._send_pipeline_cmd("UPDATE_ADAPTIVE_STRIDE", enabled)
 
     def _send_pipeline_cmd(self, cmd_type: str, payload: Any = None) -> None:
         try:
@@ -2174,9 +2341,27 @@ class MainWindow(QMainWindow):
         self.timeline.update_position(frame_idx)
         self._current_frame_idx = frame_idx
 
+    def _show_video_frame(self, frame_idx: int) -> None:
+        """Read a single frame from disk and display it on the canvas."""
+        if not self._video_path:
+            return
+        cap = cv2.VideoCapture(self._video_path, cv2.CAP_MSMF)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(self._video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            max_h = self.control.get_max_height()
+            if max_h and frame.shape[0] > max_h:
+                scale = max_h / frame.shape[0]
+                frame = cv2.resize(frame, (int(frame.shape[1] * scale), max_h),
+                                   interpolation=cv2.INTER_AREA)
+            self.canvas.load_frame(frame)
+
     def _on_end_of_video(self) -> None:
-        self.timeline.set_playing(False)
-        self._status_bar.showMessage("End of video.")
+        self._on_stop_tracking()
+        self._status_bar.showMessage("End of video — ready to restart.")
 
     def _launch_gpu_process(
         self,
@@ -2191,8 +2376,10 @@ class MainWindow(QMainWindow):
             self._gpu_process.terminate()
             self._gpu_process.join(timeout=2)
 
-        # Drain stale items from queues
-        for q_name in ("raw_frame_queue", "display_queue"):
+        # Drain stale items from queues — including pipeline_cmd_queue, which
+        # can hold a STOP command from the previous run if the GPU process exited
+        # naturally (stage threads all died) before consuming it.
+        for q_name in ("raw_frame_queue", "display_queue", "pipeline_cmd_queue"):
             q = self._queues[q_name]
             while True:
                 try:
@@ -2221,8 +2408,14 @@ class MainWindow(QMainWindow):
             "proj_valley_thresh": self.control.get_proj_valley_thresh(),
             "erosion_split":      self.control.get_erosion_split(),
             "detection_mode":     self.control.get_detection_mode(),
-            "native_w":         self._native_w,
-            "native_h":         self._native_h,
+            "native_w":           self._native_w,
+            "native_h":           self._native_h,
+            "fastsam_conf":       self.control.get_fastsam_conf(),
+            "fastsam_iou":        self.control.get_fastsam_iou(),
+            "ema_threshold":      self.control.get_ema_threshold(),
+            "ema_alpha":          self.control.get_ema_alpha(),
+            "area_ceiling_pct":   self.control.get_area_ceiling(),
+            "adaptive_stride":    self.control.get_adaptive_stride(),
         }
 
         self._gpu_process = GPUPipelineProcess(

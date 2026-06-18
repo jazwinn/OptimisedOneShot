@@ -518,6 +518,8 @@ class FastSAMTracker:
         self,
         frame_bgr: np.ndarray,
         roi_xyxy:  tuple,
+        conf:      float = 0.40,
+        iou:       float = 0.90,
     ) -> tuple[list, list]:
         """
         Segment inside a padded ROI.  Faster than full-frame; yields 2–5
@@ -544,7 +546,7 @@ class FastSAMTracker:
 
         if x2 <= x1 or y2 <= y1:
             logger.debug("ROI collapsed; falling back to full-frame.")
-            return self.predict_full(frame_bgr)
+            return self.predict_full(frame_bgr, conf=conf, iou=iou)
 
         crop    = frame_bgr[y1:y2, x1:x2]
         crop_h  = y2 - y1
@@ -556,8 +558,8 @@ class FastSAMTracker:
                     results = self._model.predict(
                         source       = crop,
                         device       = self._device,
-                        conf         = 0.40,
-                        iou          = 0.90,
+                        conf         = conf,
+                        iou          = iou,
                         retina_masks = True,
                         verbose      = False,
                     )
@@ -581,6 +583,8 @@ class FastSAMTracker:
     def predict_full(
         self,
         frame_bgr: np.ndarray,
+        conf:      float = 0.35,
+        iou:       float = 0.90,
     ) -> tuple[list, list]:
         """
         Full-frame FastSAM 'everything' mode for re-acquisition.
@@ -600,8 +604,8 @@ class FastSAMTracker:
                     results = self._model.predict(
                         source       = frame_bgr,
                         device       = self._device,
-                        conf         = 0.35,
-                        iou          = 0.90,
+                        conf         = conf,
+                        iou          = iou,
                         retina_masks = True,
                         verbose      = False,
                     )
@@ -859,10 +863,37 @@ class ReIDEmbedder:
     @staticmethod
     def _preprocess_crop(crop_bgr: np.ndarray) -> "torch.Tensor":
         """
-        Resize to (REID_W, REID_H), convert BGR→RGB, normalise to ImageNet
-        stats, and return a float32 (3, H, W) CPU tensor.
+        Pad crop to 1:2 portrait ratio (preserving aspect), then resize to
+        (REID_W, REID_H). Padding uses the mean colour of the crop so the
+        backbone doesn't see hard black bars that distort embeddings.
+        Convert BGR→RGB, normalise to ImageNet stats, return float32 (3,H,W).
         """
         import torch
+
+        h, w = crop_bgr.shape[:2]
+        target_ratio = _REID_H / _REID_W   # 2.0
+        crop_ratio   = h / max(w, 1)
+
+        if crop_ratio < target_ratio:
+            # Too wide — pad top/bottom
+            need_h  = int(round(w * target_ratio))
+            pad_tot = need_h - h
+            pad_top = pad_tot // 2
+            pad_bot = pad_tot - pad_top
+            mean_col = crop_bgr.mean(axis=(0, 1), keepdims=True).astype(np.uint8)
+            top_bar  = np.broadcast_to(mean_col, (pad_top, w, 3)).copy()
+            bot_bar  = np.broadcast_to(mean_col, (pad_bot, w, 3)).copy()
+            crop_bgr = np.concatenate([top_bar, crop_bgr, bot_bar], axis=0)
+        elif crop_ratio > target_ratio:
+            # Too tall — pad left/right
+            need_w   = int(round(h / target_ratio))
+            pad_tot  = need_w - w
+            pad_left = pad_tot // 2
+            pad_right = pad_tot - pad_left
+            mean_col = crop_bgr.mean(axis=(0, 1), keepdims=True).astype(np.uint8)
+            left_bar  = np.broadcast_to(mean_col, (h, pad_left, 3)).copy()
+            right_bar = np.broadcast_to(mean_col, (h, pad_right, 3)).copy()
+            crop_bgr = np.concatenate([left_bar, crop_bgr, right_bar], axis=1)
 
         resized = cv2.resize(crop_bgr, (_REID_W, _REID_H),
                              interpolation=cv2.INTER_LINEAR)
@@ -938,6 +969,7 @@ class EMAGallery:
         v = initial_emb.copy().astype(np.float32)
         norm = np.linalg.norm(v)
         self._v_ref          = v / norm if norm > 0 else v
+        self._anchor         = self._v_ref.copy()   # immutable registration ref
         self._ema_alpha      = float(ema_alpha)
         self._ema_threshold  = float(ema_threshold)
         self._match_threshold = float(match_threshold)
@@ -953,7 +985,7 @@ class EMAGallery:
         Thread-safe.
         """
         with self._lock:
-            return float(np.dot(self._v_ref, emb))
+            return float(max(np.dot(self._v_ref, emb), np.dot(self._anchor, emb)))
 
     def best_match(self, emb_batch: np.ndarray) -> tuple[int, float]:
         """
@@ -968,7 +1000,7 @@ class EMAGallery:
         (best_idx: int, similarity: float)
         """
         with self._lock:
-            sims = emb_batch @ self._v_ref   # [N]  dot products
+            sims = np.maximum(emb_batch @ self._v_ref, emb_batch @ self._anchor)
         best_idx = int(np.argmax(sims))
         return best_idx, float(sims[best_idx])
 
@@ -987,8 +1019,12 @@ class EMAGallery:
         best_sim      : float       its similarity score
         """
         with self._lock:
-            sims  = emb_batch @ self._v_ref   # [N]
+            sims_ema    = emb_batch @ self._v_ref    # [N] against EMA ref
+            sims_anchor = emb_batch @ self._anchor   # [N] against immutable anchor
             thresh = self._match_threshold
+        # Use max of EMA and anchor similarity — anchor prevents drift from
+        # pulling a well-matched registration away from threshold after occlusion
+        sims = np.maximum(sims_ema, sims_anchor)
         best_idx = int(np.argmax(sims))
         best_sim = float(sims[best_idx])
         accepted_idxs = [i for i in range(len(sims)) if float(sims[i]) >= thresh]
@@ -1046,6 +1082,12 @@ class EMAGallery:
 
     def set_match_threshold(self, value: float) -> None:
         self._match_threshold = float(value)
+
+    def set_ema_threshold(self, value: float) -> None:
+        self._ema_threshold = float(value)
+
+    def set_ema_alpha(self, value: float) -> None:
+        self._ema_alpha = float(value)
 
 
 # ---------------------------------------------------------------------------

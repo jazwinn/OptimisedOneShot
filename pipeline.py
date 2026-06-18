@@ -167,32 +167,62 @@ def _bbox_to_mask_cuda(bbox_xyxy: tuple, H: int, W: int):
 
 def _projection_valley_split(m_np: np.ndarray, min_area: int, max_ratio: float = 0.35) -> list | None:
     """
-    Split a merged mask at the column or row with the deepest projection valley.
+    Split a merged mask at any column or row whose projection depth is a valley.
 
-    Uses the RAW (unsmoothed) projection minimum.  Even a 1-pixel-wide separator
-    creates a zero in the raw projection, which smoothing would have completely
-    destroyed.  The mean is computed over the active region for normalisation.
+    All positions where proj / avg <= max_ratio are treated as candidates.
+    They are tried deepest-first so the clearest separator wins. Each candidate
+    is validated by checking that both resulting halves exceed min_area —
+    this naturally rejects false valleys at the mask boundary without any
+    positional exclusion zone.
     """
 
-    def _try_axis(proj: np.ndarray, idx_on: np.ndarray) -> tuple | None:
-        """Return (split_pos, valley_ratio) or None."""
+    def _try_axis(proj: np.ndarray, idx_on: np.ndarray, make_halves) -> list | None:
+        """
+        Find the best valid split along this axis.
+        make_halves(pos) → (left_np, right_np)
+        """
         if len(idx_on) < 8:
             return None
         x0, x1 = int(idx_on[0]), int(idx_on[-1])
-        span = x1 - x0
-        if span < 8:
+        if x1 - x0 < 8:
             return None
-        s = x0 + max(1, int(span * 0.10))
-        e = x0 + max(2, int(span * 0.90))
-        if e <= s:
+
+        avg = float(proj[idx_on].mean())
+        if avg <= 0:
             return None
-        # Raw minimum — no smoothing so thin gaps aren't averaged away.
-        x_split = int(s + int(np.argmin(proj[s:e])))
-        valley   = float(proj[x_split])
-        avg      = float(proj[idx_on].mean())
-        if avg <= 0 or valley / avg > max_ratio:
+
+        # All interior positions (excluding the outermost active cols) where
+        # the valley is deep enough. "Interior" = not the very first/last pixel
+        # of the mask, since those would produce a zero-pixel half.
+        inner = np.arange(x0 + 1, x1, dtype=np.int32)
+        if len(inner) == 0:
             return None
-        return x_split, valley / avg
+        ratios = proj[inner] / avg
+        valid  = inner[ratios <= max_ratio]
+        if len(valid) == 0:
+            return None
+
+        # Sort candidates by depth (smallest ratio = deepest valley first).
+        order      = np.argsort(ratios[ratios <= max_ratio])
+        candidates = valid[order]
+
+        # For each candidate, fast-check min_area from the projection sums
+        # before allocating mask copies — projection sum ≈ pixel count.
+        cumsum = np.cumsum(proj)  # full-frame cumulative column/row sum
+        total  = float(proj[idx_on].sum())
+
+        for pos in candidates:
+            pos = int(pos)
+            left_sum  = float(cumsum[pos - 1] - (cumsum[x0 - 1] if x0 > 0 else 0))
+            right_sum = total - left_sum
+            if left_sum < min_area or right_sum < min_area:
+                continue
+            left_np, right_np = make_halves(pos)
+            parts = [s for s in (left_np, right_np) if int(s.sum()) >= min_area]
+            if len(parts) >= 2:
+                return parts
+
+        return None
 
     proj_x  = m_np.sum(axis=0).astype(np.float32)
     proj_y  = m_np.sum(axis=1).astype(np.float32)
@@ -200,26 +230,22 @@ def _projection_valley_split(m_np: np.ndarray, min_area: int, max_ratio: float =
     rows_on = (proj_y > 0).nonzero()[0]
 
     # --- Try left-right split ---
-    hit = _try_axis(proj_x, cols_on)
-    if hit:
-        x = hit[0]
+    def _halves_x(x):
         left  = m_np.copy(); left[:, x:] = 0
         right = m_np.copy(); right[:, :x] = 0
-        parts = [sub for sub in (left, right) if int(sub.sum()) >= min_area]
-        if len(parts) >= 2:
-            return parts
+        return left, right
+
+    result = _try_axis(proj_x, cols_on, _halves_x)
+    if result:
+        return result
 
     # --- Try top-bottom split ---
-    hit = _try_axis(proj_y, rows_on)
-    if hit:
-        y = hit[0]
+    def _halves_y(y):
         top    = m_np.copy(); top[y:, :] = 0
         bottom = m_np.copy(); bottom[:y, :] = 0
-        parts = [sub for sub in (top, bottom) if int(sub.sum()) >= min_area]
-        if len(parts) >= 2:
-            return parts
+        return top, bottom
 
-    return None
+    return _try_axis(proj_y, rows_on, _halves_y)
 
 
 def _erosion_split(m_np: np.ndarray, min_area: int) -> list | None:
@@ -260,6 +286,7 @@ def _erosion_split(m_np: np.ndarray, min_area: int) -> list | None:
             result.append(sub)
 
     return result if len(result) >= 2 else None
+
 
 
 def split_masks_by_separators(
@@ -350,7 +377,11 @@ def split_masks_by_separators(
                         m_np[local_sep == 1] = 0
 
         n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m_np, connectivity=4)
-        comps = [i for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+        # Use a smaller floor when the separator cut produces multiple pieces.
+        # The standard min_area (≈30% of registered area) would discard a valid
+        # small component from an off-centre separator; halving it keeps edge splits.
+        comp_min = max(64, min_area // 2) if n_labels > 2 else min_area
+        comps = [i for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] >= comp_min]
 
         if len(comps) <= 1:
             # --- Stage 2a: projection-valley split ---------------------------
@@ -667,10 +698,9 @@ class InferThread(threading.Thread):
         """
         import torch
 
-        stride         = max(1, int(self._cfg.get("stride", 1)))
+        base_stride    = max(1, int(self._cfg.get("stride", 1)))
         detection_mode = bool(self._cfg.get("detection_mode", False))
         H, W           = self._H, self._W
-        run_full       = detection_mode or (self._frame_count % stride == 0)
 
         # ── 1. Tracker predict ────────────────────────────────────────
         if detection_mode:
@@ -681,12 +711,43 @@ class InferThread(threading.Thread):
             ok, bbox_xywh, conf = self._tracker.update(frame_bgr_np)
             bbox_xyxy = _xywh_to_xyxy(bbox_xywh) if ok else self._last_bbox_xyxy or (0, 0, W, H)
 
+        # ── 1b. Adaptive stride (P1) ──────────────────────────────────
+        # Auto-throttle FastSAM during stable high-confidence tracking to save
+        # GPU time.  Revert to base_stride when tracker or Re-ID confidence drops.
+        if bool(self._cfg.get("adaptive_stride", False)) and not detection_mode and ok:
+            if conf > 0.7 and self._last_sim > 0.80:
+                effective_stride = max(base_stride, 2)
+            elif conf < 0.5 or self._last_sim < 0.70:
+                effective_stride = 1
+            else:
+                effective_stride = base_stride
+        else:
+            effective_stride = base_stride
+
+        run_full = detection_mode or (self._frame_count % effective_stride == 0)
+
+        # ── 1c. Temporal consistency gate (A5) ───────────────────────
+        # If the tracker bbox center jumps more than 50% of the object width in
+        # one frame, the tracker likely snapped to the wrong object.  Force a
+        # full-frame re-acquisition pass so Re-ID can correct it.
+        if ok and self._last_bbox_xyxy is not None and not detection_mode:
+            lx1, ly1, lx2, ly2 = self._last_bbox_xyxy
+            cx1, cy1, cx2, cy2 = bbox_xyxy
+            obj_w = max(lx2 - lx1, 1)
+            dc = ((cx1 + cx2) / 2 - (lx1 + lx2) / 2) ** 2 + \
+                 ((cy1 + cy2) / 2 - (ly1 + ly2) / 2) ** 2
+            if dc > (0.5 * obj_w) ** 2:
+                run_full = True
+                conf     = 0.0   # treat as low-confidence → full-frame mode
+
         # ── 2. FastSAM (ROI or full) ──────────────────────────────────
         if not run_full:
             return self._propagate(idx, frame_cuda, bbox_xyxy, ok)
 
+        fs_conf = float(self._cfg.get("fastsam_conf", 0.35))
+        fs_iou  = float(self._cfg.get("fastsam_iou",  0.90))
         if detection_mode or conf < 0.4:
-            masks_cuda, bboxes_xyxy = self._fsam.predict_full(frame_bgr_np)
+            masks_cuda, bboxes_xyxy = self._fsam.predict_full(frame_bgr_np, conf=fs_conf, iou=fs_iou)
             mode = "detect" if detection_mode else "full"
         else:
             # Widen ROI to cover every object matched last frame, not just
@@ -698,7 +759,7 @@ class InferThread(threading.Thread):
                 )
             else:
                 roi_xyxy = _pad_bbox_xyxy(bbox_xywh, 0.20, H, W)
-            masks_cuda, bboxes_xyxy = self._fsam.predict_roi(frame_bgr_np, roi_xyxy)
+            masks_cuda, bboxes_xyxy = self._fsam.predict_roi(frame_bgr_np, roi_xyxy, conf=fs_conf, iou=fs_iou)
             mode = "roi"
 
         # ── 2b. Split merged masks at black separator lines ───────────
@@ -708,6 +769,10 @@ class InferThread(threading.Thread):
             or self._cfg.get("erosion_split",     True)
         )
         if any_split_on and masks_cuda:
+            # P3: skip expensive erosion split when tracker is already confident
+            erosion_ok = bool(self._cfg.get("erosion_split", True))
+            if erosion_ok and conf > 0.6 and self._last_sim > 0.85:
+                erosion_ok = False
             masks_cuda, bboxes_xyxy = split_masks_by_separators(
                 frame_bgr_np, masks_cuda, bboxes_xyxy,
                 sep_thresh        = int(self._cfg.get("separator_thresh",   40)),
@@ -715,15 +780,12 @@ class InferThread(threading.Thread):
                 use_col_cut       = bool(self._cfg.get("separator_split",   True)),
                 use_proj_valley   = bool(self._cfg.get("proj_valley_split", True)),
                 proj_valley_thresh= int(self._cfg.get("proj_valley_thresh", 35)),
-                use_erosion       = bool(self._cfg.get("erosion_split",     True)),
+                use_erosion       = erosion_ok,
             )
 
         # ── 2c. Reject background-scale masks ────────────────────────
-        # Masks covering more than 55% of the frame are overwhelmingly likely
-        # to be the background or the whole scene — not an individual object.
-        # Keeping them pollutes Re-ID: a black-background mask embeds similarly
-        # to any registration crop that had black fill for non-polygon pixels.
-        max_mask_pixels = int(H * W * 0.55)
+        area_ceil_pct   = float(self._cfg.get("area_ceiling_pct", 55)) / 100.0
+        max_mask_pixels = int(H * W * area_ceil_pct)
         if masks_cuda:
             filtered = [
                 (m, b) for m, b in zip(masks_cuda, bboxes_xyxy)
@@ -1115,8 +1177,12 @@ class GPUPipelineProcess(mp.Process):
         "erosion_split":           True,
         "min_component_area_frac": 0.30,
         "detection_mode":          False,
-        "native_w":                0,   # 0 = same as vid_w (no upscale needed)
+        "native_w":                0,
         "native_h":                0,
+        "fastsam_conf":            0.35,
+        "fastsam_iou":             0.90,
+        "area_ceiling_pct":        55,
+        "adaptive_stride":         False,
     }
 
     def __init__(
@@ -1240,8 +1306,8 @@ class GPUPipelineProcess(mp.Process):
                 probe.release()
 
         # ── Internal queues ───────────────────────────────────────────
-        decode_to_infer: queue.Queue = queue.Queue(maxsize=3)
-        infer_to_blend:  queue.Queue = queue.Queue(maxsize=3)
+        decode_to_infer: queue.Queue = queue.Queue(maxsize=6)
+        infer_to_blend:  queue.Queue = queue.Queue(maxsize=6)
         stop_event = threading.Event()
 
         # Shared live config — mutated by the command loop below.
@@ -1255,6 +1321,10 @@ class GPUPipelineProcess(mp.Process):
             "proj_valley_thresh": cfg.get("proj_valley_thresh", 35),
             "erosion_split":      cfg.get("erosion_split",      True),
             "detection_mode":     cfg.get("detection_mode",     False),
+            "fastsam_conf":       cfg.get("fastsam_conf",       0.35),
+            "fastsam_iou":        cfg.get("fastsam_iou",        0.90),
+            "area_ceiling_pct":   cfg.get("area_ceiling_pct",   55),
+            "adaptive_stride":    cfg.get("adaptive_stride",    False),
         }
 
         # ── Spawn stage threads ───────────────────────────────────────
@@ -1332,6 +1402,20 @@ class GPUPipelineProcess(mp.Process):
                 live_cfg["erosion_split"] = bool(cmd.payload)
             elif cmd.type == "UPDATE_DETECTION_MODE":
                 live_cfg["detection_mode"] = bool(cmd.payload)
+            elif cmd.type == "UPDATE_FASTSAM_CONF":
+                live_cfg["fastsam_conf"] = float(cmd.payload)
+            elif cmd.type == "UPDATE_FASTSAM_IOU":
+                live_cfg["fastsam_iou"] = float(cmd.payload)
+            elif cmd.type == "UPDATE_AREA_CEILING":
+                live_cfg["area_ceiling_pct"] = float(cmd.payload)
+            elif cmd.type == "UPDATE_ADAPTIVE_STRIDE":
+                live_cfg["adaptive_stride"] = bool(cmd.payload)
+            elif cmd.type == "UPDATE_EMA_THRESHOLD":
+                live_cfg["ema_threshold"] = float(cmd.payload)
+                ema_gallery.set_ema_threshold(float(cmd.payload))
+            elif cmd.type == "UPDATE_EMA_ALPHA":
+                live_cfg["ema_alpha"] = float(cmd.payload)
+                ema_gallery.set_ema_alpha(float(cmd.payload))
 
         # ── Graceful shutdown ─────────────────────────────────────────
         stop_event.set()
