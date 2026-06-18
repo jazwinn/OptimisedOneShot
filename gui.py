@@ -65,6 +65,7 @@ from qtpy.QtGui import (
 from qtpy.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QGraphicsPixmapItem,
@@ -97,6 +98,27 @@ class Cmd(NamedTuple):
     """Lightweight command message routed through in-process threading.Queues."""
     type: str       # SEEK | PLAY | PAUSE | START_TRACKING | STOP_TRACKING | STOP
     payload: Any = None
+
+
+# ---------------------------------------------------------------------------
+# Frame resize helper
+# ---------------------------------------------------------------------------
+
+def _fit_frame(frame_bgr: np.ndarray, max_h: int) -> np.ndarray:
+    """
+    Downscale frame_bgr so its height does not exceed max_h, preserving
+    aspect ratio.  Returns the original array unchanged when max_h is 0 or
+    the frame already fits.
+    """
+    if max_h == 0:
+        return frame_bgr
+    h, w = frame_bgr.shape[:2]
+    if h <= max_h:
+        return frame_bgr
+    scale = max_h / h
+    new_w = max(1, int(round(w * scale)))
+    new_h = max_h
+    return cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +647,7 @@ class ControlPanel(QWidget):
     sep_split_toggled  = Signal(bool)   # split merged masks at black separators
     sep_thresh_changed = Signal(int)    # separator darkness threshold 0–120
     detection_mode_toggled = Signal(bool)  # skip tracker, full-frame detect every frame
+    max_height_changed     = Signal(int)   # 0 = native, else max frame height
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -673,6 +696,10 @@ class ControlPanel(QWidget):
 
     def get_detection_mode(self) -> bool:
         return self.detection_mode_check.isChecked()
+
+    def get_max_height(self) -> int:
+        """Return the selected max inference height, 0 = native."""
+        return self.resolution_combo.currentData()
 
     def get_separator_thresh(self) -> int:
         return self.sep_thresh_spin.value()
@@ -763,7 +790,7 @@ class ControlPanel(QWidget):
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.50, 0.99)
         self.threshold_spin.setSingleStep(0.01)
-        self.threshold_spin.setValue(0.85)
+        self.threshold_spin.setValue(0.65)
         self.threshold_spin.setDecimals(2)
         self.threshold_spin.valueChanged.connect(self.threshold_changed)
         thr_row.addWidget(self.threshold_spin)
@@ -794,6 +821,29 @@ class ControlPanel(QWidget):
         self.stride_spin.valueChanged.connect(self.stride_changed)
         str_row.addWidget(self.stride_spin)
         root.addLayout(str_row)
+
+        # Inference resolution cap
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel("Max Inference Res:"))
+        self.resolution_combo = QComboBox()
+        for label, max_h in [
+            ("Native", 0),
+            ("1080p", 1080),
+            ("720p",  720),
+            ("480p",  480),
+            ("360p",  360),
+        ]:
+            self.resolution_combo.addItem(label, max_h)
+        self.resolution_combo.setCurrentIndex(2)   # default 720p
+        self.resolution_combo.setToolTip(
+            "Downscale frames to this height before inference. "
+            "Lower = faster but less detail. Takes effect on next video load."
+        )
+        self.resolution_combo.currentIndexChanged.connect(
+            lambda _: self.max_height_changed.emit(self.resolution_combo.currentData())
+        )
+        res_row.addWidget(self.resolution_combo)
+        root.addLayout(res_row)
 
         # Separator splitting — cut merged masks at black lines between objects
         self.sep_split_check = QCheckBox("Split by separators")
@@ -926,6 +976,7 @@ class MaskPreviewThread(QThread):
         points: list,
         fastsam_weights: str,
         separator_thresh: int = 40,
+        max_height: int = 0,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -935,6 +986,7 @@ class MaskPreviewThread(QThread):
         self._points          = list(points)
         self._fastsam_weights = fastsam_weights
         self._separator_thresh = separator_thresh
+        self._max_height      = max_height
 
     def run(self) -> None:
         try:
@@ -953,6 +1005,7 @@ class MaskPreviewThread(QThread):
         cap.release()
         if not ret:
             return
+        frame_bgr = _fit_frame(frame_bgr, self._max_height)
 
         self.progress.emit("Loading FastSAM for preview…")
         fast_sam = FastSAMTracker(
@@ -1031,6 +1084,7 @@ class RegistrationThread(QThread):
         precomputed_mask: Optional[np.ndarray] = None,
         precomputed_bbox: Optional[tuple] = None,
         precomputed_quad: Optional[np.ndarray] = None,
+        max_height: int = 0,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -1044,6 +1098,7 @@ class RegistrationThread(QThread):
         self._precomputed_mask = precomputed_mask   # H×W uint8 *255, from MaskPreviewThread
         self._precomputed_bbox = precomputed_bbox   # (x, y, w, h)
         self._precomputed_quad = precomputed_quad   # (4, 2) int32, from MaskPreviewThread
+        self._max_height       = max_height
 
     def run(self) -> None:
         import torch
@@ -1081,6 +1136,7 @@ class RegistrationThread(QThread):
         if not ret or frame_bgr is None:
             self.error.emit(f"Could not read frame {self._frame_idx}.")
             return
+        frame_bgr = _fit_frame(frame_bgr, self._max_height)
 
         # ── FastSAM registration (skipped when live preview already ran) ─
         if self._precomputed_mask is not None and self._precomputed_bbox is not None:
@@ -1221,11 +1277,13 @@ class VideoReaderThread(QThread):
         self,
         video_path: str,
         raw_frame_queue,             # mp.Queue
+        max_height: int = 0,         # 0 = native; else downscale before emit
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._path            = video_path
         self._raw_frame_queue = raw_frame_queue
+        self._max_height      = max_height
         self._cmd_q           = queue.Queue()         # threading.Queue (in-process)
         self._stop_event      = threading.Event()
 
@@ -1304,7 +1362,7 @@ class VideoReaderThread(QThread):
                     ret, frame = cap.read()
                     if ret:
                         current_idx = idx
-                        self.preview_frame.emit(idx, frame.copy())
+                        self.preview_frame.emit(idx, _fit_frame(frame, self._max_height))
 
                 elif cmd.type == "PLAY":
                     playing = True
@@ -1344,7 +1402,7 @@ class VideoReaderThread(QThread):
                     playing = False
                     self.end_of_video.emit()
                     continue
-                self.preview_frame.emit(current_idx, frame.copy())
+                self.preview_frame.emit(current_idx, _fit_frame(frame, self._max_height))
                 current_idx += 1
                 elapsed = time.monotonic() - t0
                 sleep_t = frame_delay - elapsed
@@ -1355,6 +1413,8 @@ class VideoReaderThread(QThread):
             elif tracking:
                 t0 = time.monotonic()
                 ret, frame = cap.read()
+                if ret:
+                    frame = _fit_frame(frame, self._max_height)
                 if not ret:
                     # End of video — send sentinel
                     try:
@@ -1603,8 +1663,8 @@ class MainWindow(QMainWindow):
             self._show_error(f"Cannot open video:\n{path}")
             return
 
-        self._vid_w       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self._vid_h       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        native_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        native_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self._video_fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
         self._total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -1615,6 +1675,12 @@ class MainWindow(QMainWindow):
         if not ret:
             self._show_error("Video file appears to be empty or unreadable.")
             return
+
+        # Apply resolution cap — all downstream processing uses the scaled size.
+        max_h = self.control.get_max_height()
+        frame = _fit_frame(frame, max_h)
+        self._vid_w = frame.shape[1]
+        self._vid_h = frame.shape[0]
 
         self._current_frame_idx = 0
         self.canvas.set_video_size(self._vid_w, self._vid_h)
@@ -1628,8 +1694,11 @@ class MainWindow(QMainWindow):
         self.control.set_register_enabled(True)
         self.control.clear_pts_btn.setEnabled(True)
         self.control.set_track_controls_enabled(False)
+        res_note = (
+            f" (native {native_w}×{native_h})" if (native_w != self._vid_w or native_h != self._vid_h) else ""
+        )
         self.control.set_status(
-            f"{self._vid_w}×{self._vid_h}  ·  {self._video_fps:.2f} fps  ·  "
+            f"{self._vid_w}×{self._vid_h}{res_note}  ·  {self._video_fps:.2f} fps  ·  "
             f"{self._total_frames} frames"
         )
         self._status_bar.showMessage("Video loaded. Drag to draw a bounding box around the target, then click Register.")
@@ -1713,6 +1782,7 @@ class MainWindow(QMainWindow):
             points           = self.canvas.get_prompt_points(),
             fastsam_weights  = self.control.get_fastsam_weights(),
             separator_thresh = self.control.get_separator_thresh(),
+            max_height       = self.control.get_max_height(),
             parent           = self,
         )
         self._preview_thread.preview_ready.connect(self._on_mask_preview_ready)
@@ -1780,6 +1850,7 @@ class MainWindow(QMainWindow):
             precomputed_mask  = self._live_mask,
             precomputed_bbox  = self._live_bbox_xywh,
             precomputed_quad  = self._live_quad,
+            max_height        = self.control.get_max_height(),
             parent            = self,
         )
         self._reg_thread.registration_done.connect(self._on_registration_done)
@@ -1987,6 +2058,7 @@ class MainWindow(QMainWindow):
         self._reader_thread = VideoReaderThread(
             self._video_path,
             self._queues["raw_frame_queue"],
+            max_height=self.control.get_max_height(),
             parent=self,
         )
         self._reader_thread.preview_frame.connect(self._on_preview_frame)
