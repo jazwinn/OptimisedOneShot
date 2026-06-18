@@ -646,6 +646,9 @@ class ControlPanel(QWidget):
     live_preview_toggled = Signal(bool)
     sep_split_toggled  = Signal(bool)   # split merged masks at black separators
     sep_thresh_changed = Signal(int)    # separator darkness threshold 0–120
+    proj_valley_toggled      = Signal(bool)  # projection-valley split on/off
+    proj_valley_thresh_changed = Signal(int) # max valley ratio (%) 5–80
+    erosion_split_toggled    = Signal(bool)  # erosion-based split on/off
     detection_mode_toggled = Signal(bool)  # skip tracker, full-frame detect every frame
     max_height_changed     = Signal(int)   # 0 = native, else max frame height
 
@@ -703,6 +706,15 @@ class ControlPanel(QWidget):
 
     def get_separator_thresh(self) -> int:
         return self.sep_thresh_spin.value()
+
+    def get_proj_valley_split(self) -> bool:
+        return self.proj_valley_check.isChecked()
+
+    def get_proj_valley_thresh(self) -> int:
+        return self.proj_valley_thresh_spin.value()
+
+    def get_erosion_split(self) -> bool:
+        return self.erosion_check.isChecked()
 
     # ------------------------------------------------------------------
     # Build UI
@@ -845,29 +857,6 @@ class ControlPanel(QWidget):
         res_row.addWidget(self.resolution_combo)
         root.addLayout(res_row)
 
-        # Separator splitting — cut merged masks at black lines between objects
-        self.sep_split_check = QCheckBox("Split by separators")
-        self.sep_split_check.setChecked(True)
-        self.sep_split_check.setToolTip(
-            "Split touching objects apart along the near-black lines that "
-            "separate them. Disable for videos without separator lines."
-        )
-        self.sep_split_check.toggled.connect(self.sep_split_toggled)
-        root.addWidget(self.sep_split_check)
-
-        sep_row = QHBoxLayout()
-        sep_row.addWidget(QLabel("Separator darkness ≤:"))
-        self.sep_thresh_spin = QSpinBox()
-        self.sep_thresh_spin.setRange(0, 120)
-        self.sep_thresh_spin.setValue(40)
-        self.sep_thresh_spin.setToolTip(
-            "Pixels darker than this (0–255 grayscale) are treated as separator "
-            "lines and cut out when splitting masks."
-        )
-        self.sep_thresh_spin.valueChanged.connect(self.sep_thresh_changed)
-        sep_row.addWidget(self.sep_thresh_spin)
-        root.addLayout(sep_row)
-
         # Live preview toggle
         self.live_preview_check = QCheckBox("Live Preview Mode")
         self.live_preview_check.setChecked(True)
@@ -884,6 +873,104 @@ class ControlPanel(QWidget):
         )
         self.detection_mode_check.toggled.connect(self.detection_mode_toggled)
         root.addWidget(self.detection_mode_check)
+
+        # ── Separators ────────────────────────────────────────────────
+        root.addWidget(self._make_separator("Separators"))
+
+        sep_hint = QLabel(
+            "Three cascading algorithms to split FastSAM masks that\n"
+            "merge two adjacent objects into one region."
+        )
+        sep_hint.setStyleSheet("color: #666; font-size: 9px;")
+        root.addWidget(sep_hint)
+
+        # --- 1. Dark Column Cut ---
+        self.sep_split_check = QCheckBox("Dark Column Cut")
+        self.sep_split_check.setChecked(True)
+        self.sep_split_check.setToolTip(
+            "<b>Dark Column Cut</b><br>"
+            "Detects near-black separator lines by averaging brightness across<br>"
+            "each column and row of the frame. Any column whose mean brightness<br>"
+            "falls below the threshold is treated as a separator and removed from<br>"
+            "the mask before running connected-component labelling.<br><br>"
+            "Works best when the separator spans the full height/width of the<br>"
+            "objects. Robust to per-pixel JPEG noise because it uses column means."
+        )
+        self.sep_split_check.toggled.connect(self.sep_split_toggled)
+        root.addWidget(self.sep_split_check)
+
+        sep_thresh_row = QHBoxLayout()
+        sep_thresh_row.setContentsMargins(16, 0, 0, 0)
+        lbl_thresh = QLabel("Darkness ≤")
+        lbl_thresh.setToolTip("Pixels with grayscale value ≤ this are classified as separator.")
+        sep_thresh_row.addWidget(lbl_thresh)
+        self.sep_thresh_spin = QSpinBox()
+        self.sep_thresh_spin.setRange(0, 120)
+        self.sep_thresh_spin.setValue(40)
+        self.sep_thresh_spin.setSuffix(" gray")
+        self.sep_thresh_spin.setToolTip(
+            "<b>Separator darkness threshold (0–120)</b><br>"
+            "Pixels with grayscale intensity ≤ this value are classified as<br>"
+            "separator lines and cut from the mask. Raise this if the separator<br>"
+            "has bright artifacts and isn't being detected; lower it if unrelated<br>"
+            "dark regions are incorrectly cutting into objects."
+        )
+        self.sep_thresh_spin.valueChanged.connect(self.sep_thresh_changed)
+        sep_thresh_row.addWidget(self.sep_thresh_spin)
+        root.addLayout(sep_thresh_row)
+
+        # --- 2. Projection Valley Split ---
+        self.proj_valley_check = QCheckBox("Projection Valley Split")
+        self.proj_valley_check.setChecked(True)
+        self.proj_valley_check.setToolTip(
+            "<b>Projection Valley Split</b><br>"
+            "Counts mask pixels per column (and per row) and looks for a column<br>"
+            "whose count drops to a fraction of the average — a 'valley' in the<br>"
+            "projection profile. Splits the mask there.<br><br>"
+            "Works even when the separator doesn't span the full object height:<br>"
+            "two objects touching only at the top still show a deep valley in<br>"
+            "the column pixel count at the separator location.<br><br>"
+            "Runs after Dark Column Cut if that step didn't produce a split."
+        )
+        self.proj_valley_check.toggled.connect(self.proj_valley_toggled)
+        root.addWidget(self.proj_valley_check)
+
+        pv_row = QHBoxLayout()
+        pv_row.setContentsMargins(16, 0, 0, 0)
+        lbl_pv = QLabel("Max valley ratio")
+        lbl_pv.setToolTip("Split when the minimum-density column has fewer than X% of the mean count.")
+        pv_row.addWidget(lbl_pv)
+        self.proj_valley_thresh_spin = QSpinBox()
+        self.proj_valley_thresh_spin.setRange(5, 80)
+        self.proj_valley_thresh_spin.setValue(35)
+        self.proj_valley_thresh_spin.setSuffix(" %")
+        self.proj_valley_thresh_spin.setToolTip(
+            "<b>Max valley ratio (5–80 %)</b><br>"
+            "A column is considered a separator when its pixel count is ≤ this<br>"
+            "percentage of the average column count.<br><br>"
+            "Lower = stricter (fewer false splits on objects with a natural<br>"
+            "narrow waist). Raise if a clearly separated pair isn't being split;<br>"
+            "lower if unrelated objects are being split by accident."
+        )
+        self.proj_valley_thresh_spin.valueChanged.connect(self.proj_valley_thresh_changed)
+        pv_row.addWidget(self.proj_valley_thresh_spin)
+        root.addLayout(pv_row)
+
+        # --- 3. Erosion Split ---
+        self.erosion_check = QCheckBox("Erosion Split (fallback)")
+        self.erosion_check.setChecked(True)
+        self.erosion_check.setToolTip(
+            "<b>Erosion Split</b><br>"
+            "Last-resort fallback. Progressively shrinks the mask with kernels<br>"
+            "of 8 → 14 → 20 → 28 px until it breaks into separate blobs, then<br>"
+            "expands each blob back to the original mask boundary via Voronoi<br>"
+            "assignment (each pixel goes to its nearest eroded seed).<br><br>"
+            "Works entirely on mask shape — no separator detection needed.<br>"
+            "Catches merged objects even when there is no visible black gap,<br>"
+            "as long as the merged mask narrows between the two objects."
+        )
+        self.erosion_check.toggled.connect(self.erosion_split_toggled)
+        root.addWidget(self.erosion_check)
 
         # ── Execution ─────────────────────────────────────────────────
         root.addWidget(self._make_separator("Execution"))
@@ -1640,6 +1727,9 @@ class MainWindow(QMainWindow):
         cp.stride_changed.connect(self._on_stride_changed)
         cp.sep_split_toggled.connect(self._on_sep_split_toggled)
         cp.sep_thresh_changed.connect(self._on_sep_thresh_changed)
+        cp.proj_valley_toggled.connect(self._on_proj_valley_toggled)
+        cp.proj_valley_thresh_changed.connect(self._on_proj_valley_thresh_changed)
+        cp.erosion_split_toggled.connect(self._on_erosion_split_toggled)
         cp.detection_mode_toggled.connect(self._on_detection_mode_toggled)
 
         # Timeline → MainWindow
@@ -2002,6 +2092,15 @@ class MainWindow(QMainWindow):
     def _on_sep_thresh_changed(self, value: int) -> None:
         self._send_pipeline_cmd("UPDATE_SEP_THRESH", value)
 
+    def _on_proj_valley_toggled(self, enabled: bool) -> None:
+        self._send_pipeline_cmd("UPDATE_PROJ_VALLEY", enabled)
+
+    def _on_proj_valley_thresh_changed(self, value: int) -> None:
+        self._send_pipeline_cmd("UPDATE_PROJ_VALLEY_THRESH", value)
+
+    def _on_erosion_split_toggled(self, enabled: bool) -> None:
+        self._send_pipeline_cmd("UPDATE_EROSION_SPLIT", enabled)
+
     def _on_detection_mode_toggled(self, enabled: bool) -> None:
         self._send_pipeline_cmd("UPDATE_DETECTION_MODE", enabled)
 
@@ -2116,9 +2215,12 @@ class MainWindow(QMainWindow):
             "vid_h":           self._vid_h,
             "video_fps":       self._video_fps,
             "total_frames":    self._total_frames,
-            "separator_split":  self.control.get_separator_split(),
-            "separator_thresh": self.control.get_separator_thresh(),
-            "detection_mode":   self.control.get_detection_mode(),
+            "separator_split":    self.control.get_separator_split(),
+            "separator_thresh":   self.control.get_separator_thresh(),
+            "proj_valley_split":  self.control.get_proj_valley_split(),
+            "proj_valley_thresh": self.control.get_proj_valley_thresh(),
+            "erosion_split":      self.control.get_erosion_split(),
+            "detection_mode":     self.control.get_detection_mode(),
             "native_w":         self._native_w,
             "native_h":         self._native_h,
         }
