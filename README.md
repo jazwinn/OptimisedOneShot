@@ -107,7 +107,7 @@ OptimisedOneShot/
 | `display_queue` | 3 | `(raw_bytes: bytes, W, H, frame_idx, meta: dict\|None)` |
 
 **`pipeline_cmd_queue` command types:**
-`STOP` · `UPDATE_THRESHOLD` · `UPDATE_ALPHA` · `UPDATE_STRIDE` · `UPDATE_SEP_SPLIT` · `UPDATE_SEP_THRESH` · `UPDATE_PROJ_VALLEY` · `UPDATE_PROJ_VALLEY_THRESH` · `UPDATE_EROSION_SPLIT` · `UPDATE_DETECTION_MODE`
+`STOP` · `UPDATE_THRESHOLD` · `UPDATE_ALPHA` · `UPDATE_STRIDE` · `UPDATE_SEP_SPLIT` · `UPDATE_SEP_THRESH`
 
 ---
 
@@ -158,7 +158,7 @@ All `*.pt` and `*.pth` files are gitignored. SAM2 is no longer needed.
 |---|---|
 | `VideoCanvas` | QGraphicsView — letterboxed video, rubber-band bbox drawing, +/- point prompts, cyan mask overlay, dashed cyan bbox rect, embedding thumbnail top-right |
 | `TimelinePanel` | Frame slider, Play/Pause, FPS readout, export progress bar |
-| `ControlPanel` | Sidebar: FastSAM/Re-ID paths, register/track/export controls, match threshold, overlay alpha, stride, inference resolution, detection mode, and a dedicated **Separators** section with three independently toggled split algorithms (see below) |
+| `ControlPanel` | Sidebar: FastSAM/Re-ID paths, register/track/export controls, match threshold, overlay alpha, stride, separator-split toggle + threshold spinbox |
 | `RegistrationThread` | QThread — FastSAM load → predict_roi(bbox) → pick best mask → isolate component → Re-ID embed → unload; emits `registration_done` |
 | `VideoReaderThread` | QThread — cv2.VideoCapture; modes SEEK/PLAY/START_TRACKING/STOP_TRACKING; batch mode (export) never drops frames |
 | `FrameDisplayWorker` | QThread — drains `display_queue`; emits `frame_ready(bytes, W, H, idx)` and `metadata_ready(dict)` |
@@ -198,9 +198,7 @@ RegistrationThread(video_path, frame_idx, bbox, points,
 | `DecodeThread` | `raw_frame_queue` → `.cuda()` → CUDA float32 3×H×W normalised `[0,1]` → `decode_to_infer_q` |
 | `InferThread` | TrackerMIL bbox → FastSAM ROI → `split_masks_by_separators()` → Re-ID embed → EMA gallery match → gate → blender queue |
 | `BlendThread` | `_alpha_blend(frame_cuda, mask_cuda, alpha)` (**cyan** BGR `[1,1,0]`) → `.cpu().numpy().tobytes()` → `display_queue`; batch export writes to `VideoWriter` |
-| `split_masks_by_separators()` | Three-stage pipeline (dark column cut → projection valley → erosion Voronoi) that expands a flat list of FastSAM masks into per-object masks; each stage independently enabled via config flags |
-| `_projection_valley_split()` | Finds the column/row with the minimum raw mask-pixel count and cuts there; no smoothing so even a 1-pixel separator gap is detected |
-| `_erosion_split()` | Progressively erodes the mask until ≥2 blobs appear; assigns original pixels to their nearest eroded seed via Voronoi distance maps |
+| `split_masks_by_separators()` | Module-level — cuts each CUDA mask along near-black pixels, runs `cv2.connectedComponentsWithStats`, expands list by splitting merged masks |
 | `_alpha_blend()` | GPU composite — cyan overlay (`B=1, G=1, R=0` in BGR tensor) at configurable opacity |
 
 **`_CONFIG_DEFAULTS` (GPUPipelineProcess):**
@@ -219,16 +217,9 @@ RegistrationThread(video_path, frame_idx, bbox, points,
     "vid_w": 1280, "vid_h": 720,
     "video_fps":       30.0,
     "total_frames":    0,
-    # --- Separator split stages (all default True) ---
-    "separator_split":         True,   # Stage 1: dark column/row cut
-    "separator_thresh":        40,     # grayscale intensity <= this = separator pixel
-    "proj_valley_split":       True,   # Stage 2a: projection valley cut
-    "proj_valley_thresh":      35,     # valley must be <= this % of mean projection
-    "erosion_split":           True,   # Stage 2b: erosion Voronoi fallback
+    "separator_split":         True,   # split touching objects at black lines
+    "separator_thresh":        40,     # pixel intensity <= this = separator
     "min_component_area_frac": 0.30,   # drop components < 30% of registered area
-    "detection_mode":          False,  # skip tracker; full-frame FastSAM every frame
-    "native_w":                0,      # 0 = same as vid_w (no export upscale needed)
-    "native_h":                0,
 }
 ```
 
@@ -255,7 +246,7 @@ RegistrationThread(video_path, frame_idx, bbox, points,
 
 ## Separator-Split Algorithm
 
-Designed for grayscale video where objects are separated by distinct near-black lines. FastSAM frequently generates one merged mask for two adjacent objects; the three-stage cascade in `split_masks_by_separators()` recovers the individual masks so Re-ID can match each one independently.
+Designed for grayscale video where objects are separated by distinct near-black lines, no objects overlap, and all objects are roughly the same size as the registered target.
 
 **At registration time** (`RegistrationThread._run_inner` → `HeavySAMRegistrar._isolate_clicked_component`):
 1. Build a separator mask: pixels with grayscale value `<= separator_thresh` (default 40).
@@ -265,42 +256,15 @@ Designed for grayscale video where objects are separated by distinct near-black 
 5. Keep only the component containing the first positive click point (or the largest component if the click landed on a separator pixel).
 
 **Per-frame during tracking** (`InferThread._process_frame` → `split_masks_by_separators`):
-
-Three independent stages run in cascade. Each stage only runs if the previous one did not produce a split, and can be toggled from the UI without restarting.
-
-**Stage 1 — Dark Column Cut** (`separator_split`, default on)
-1. Compute column-mean and row-mean brightness across the full frame. Any column/row whose mean ≤ `separator_thresh` is flagged as a separator. Union with per-pixel dark detection to catch narrow 1–2 px separators.
-2. Also compute column/row means **within each mask's bounding box** — this catches partial separators whose signal is diluted in the full-frame average.
-3. Morphological close + `dilate` iterations to widen the cut across anti-aliased edges.
-4. Zero separator pixels from the mask; run `connectedComponentsWithStats(connectivity=4)`.
-5. If ≥2 components survive → emit one CUDA mask per component and move to the next input mask.
-
-**Stage 2a — Projection Valley Split** (`proj_valley_split`, default on)
-- Activated when Stage 1 finds ≤1 component.
-- Counts mask pixels per column (`proj_x = m_np.sum(axis=0)`) and per row.
-- Searches the **raw, unsmoothed** projection minimum in the central 80% of the mask span (no box-average — smoothing destroys 1-px separator signals).
-- If `min_count / mean_count ≤ proj_valley_thresh / 100` (default 35%), cuts the mask at that column (or row).
-- Tries left-right split first, then top-bottom.
-
-**Stage 2b — Erosion Voronoi Fallback** (`erosion_split`, default on)
-- Activated when Stage 1 and 2a both fail.
-- Progressively erodes the mask with kernels 8 → 14 → 20 → 28 px until ≥2 blobs appear.
-- Assigns every original mask pixel to its nearest eroded seed via `cv2.distanceTransform` (Voronoi partition).
-- Works purely on mask shape — no separator detection required.
-
-**Component filtering** (all stages):
-- Drop components smaller than `max(64, registered_area × 0.30)`.
-- If ≤1 component remains after any stage, the original mask is passed through unchanged (safe no-op fallback).
+1. Same separator mask + dilation.
+2. For each FastSAM candidate mask: zero separator pixels, run `connectedComponentsWithStats`.
+3. Drop components smaller than `min_component_area = max(64, registered_area * 0.30)`.
+4. If ≤1 component survives: keep original mask unchanged (safe fallback).
+5. Otherwise: emit one CUDA mask + xyxy bbox per surviving component — the Re-ID gallery then picks the one closest to the registered embedding.
 
 **Live-tunable controls** (no restart needed):
-
-| UI control | Command | `live_cfg` key |
-|---|---|---|
-| Dark Column Cut checkbox | `UPDATE_SEP_SPLIT` | `separator_split` |
-| Darkness ≤ spinbox (0–120, default 40) | `UPDATE_SEP_THRESH` | `separator_thresh` |
-| Projection Valley checkbox | `UPDATE_PROJ_VALLEY` | `proj_valley_split` |
-| Max valley ratio spinbox (5–80%, default 35) | `UPDATE_PROJ_VALLEY_THRESH` | `proj_valley_thresh` |
-| Erosion Split checkbox | `UPDATE_EROSION_SPLIT` | `erosion_split` |
+- "Split by separators" checkbox → `UPDATE_SEP_SPLIT` command → `live_cfg["separator_split"]`
+- "Separator darkness ≤" spinbox (0–120, default 40) → `UPDATE_SEP_THRESH` command → `live_cfg["separator_thresh"]`
 
 ---
 
@@ -330,9 +294,7 @@ Three independent stages run in cascade. Each stage only runs if the previous on
 | Process not closing on exit | `mp.Queue` feeder threads kept process alive | `q.cancel_join_thread()` + `gpu_process.join()` after `terminate()` in `closeEvent` |
 | `TrackerCSRT` removed | OpenCV 4.10+ dropped it | All code uses `cv2.TrackerMIL_create()` |
 | Slider seek stale value | `_pending_seek_value` not updated on drag | Captured in `_on_slider_released` from `self.slider.value()` |
-| Two adjacent objects merged into one mask | FastSAM spans both objects; single mask → single Re-ID crop → wrong match | Three-stage `split_masks_by_separators()`: (1) dark column/row cut with local-bbox means, (2) raw-projection valley cut, (3) erosion Voronoi fallback |
-| Projection valley missing thin separator | Box-average smoothing (`k7`) averaged away 1-px gaps before searching for the minimum | Removed smoothing; raw `np.argmin(proj[s:e])` detects even 1-pixel-wide valleys |
-| Global column-mean misses partial separator | Full-frame column mean diluted by bright object pixels above/below a separator that doesn't span full height | Added per-mask local-bbox column-mean cut as a second separator pass inside Stage 1 |
+| Two adjacent objects merged into one mask | FastSAM spans both objects; single mask → single Re-ID crop → wrong match | `split_masks_by_separators()` cuts along black separator lines, `connectedComponents` splits into separate candidates |
 
 ---
 

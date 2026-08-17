@@ -165,218 +165,86 @@ def _bbox_to_mask_cuda(bbox_xyxy: tuple, H: int, W: int):
     return mask
 
 
-def _projection_valley_split(m_np: np.ndarray, min_area: int, max_ratio: float = 0.35) -> list | None:
-    """
-    Split a merged mask at the column or row with the deepest projection valley.
-
-    Uses the RAW (unsmoothed) projection minimum.  Even a 1-pixel-wide separator
-    creates a zero in the raw projection, which smoothing would have completely
-    destroyed.  The mean is computed over the active region for normalisation.
-    """
-
-    def _try_axis(proj: np.ndarray, idx_on: np.ndarray) -> tuple | None:
-        """Return (split_pos, valley_ratio) or None."""
-        if len(idx_on) < 8:
-            return None
-        x0, x1 = int(idx_on[0]), int(idx_on[-1])
-        span = x1 - x0
-        if span < 8:
-            return None
-        s = x0 + max(1, int(span * 0.10))
-        e = x0 + max(2, int(span * 0.90))
-        if e <= s:
-            return None
-        # Raw minimum — no smoothing so thin gaps aren't averaged away.
-        x_split = int(s + int(np.argmin(proj[s:e])))
-        valley   = float(proj[x_split])
-        avg      = float(proj[idx_on].mean())
-        if avg <= 0 or valley / avg > max_ratio:
-            return None
-        return x_split, valley / avg
-
-    proj_x  = m_np.sum(axis=0).astype(np.float32)
-    proj_y  = m_np.sum(axis=1).astype(np.float32)
-    cols_on = (proj_x > 0).nonzero()[0]
-    rows_on = (proj_y > 0).nonzero()[0]
-
-    # --- Try left-right split ---
-    hit = _try_axis(proj_x, cols_on)
-    if hit:
-        x = hit[0]
-        left  = m_np.copy(); left[:, x:] = 0
-        right = m_np.copy(); right[:, :x] = 0
-        parts = [sub for sub in (left, right) if int(sub.sum()) >= min_area]
-        if len(parts) >= 2:
-            return parts
-
-    # --- Try top-bottom split ---
-    hit = _try_axis(proj_y, rows_on)
-    if hit:
-        y = hit[0]
-        top    = m_np.copy(); top[y:, :] = 0
-        bottom = m_np.copy(); bottom[:y, :] = 0
-        parts = [sub for sub in (top, bottom) if int(sub.sum()) >= min_area]
-        if len(parts) >= 2:
-            return parts
-
-    return None
-
-
-def _erosion_split(m_np: np.ndarray, min_area: int) -> list | None:
-    """
-    Split a single binary mask by eroding until multiple components appear,
-    then Voronoi-expand each eroded seed back into the original mask pixels.
-
-    Returns a list of uint8 sub-masks, or None if the mask cannot be split
-    into ≥2 components each meeting min_area.
-    """
-    # Try increasing erosion sizes until we get multiple seeds.
-    for erode_px in (8, 14, 20, 28):
-        k = np.ones((erode_px, erode_px), np.uint8)
-        eroded = cv2.erode(m_np, k, iterations=1)
-        n, labels_e, stats_e, _ = cv2.connectedComponentsWithStats(eroded, connectivity=4)
-        seed_ids = [i for i in range(1, n) if stats_e[i, cv2.CC_STAT_AREA] >= max(16, min_area // 8)]
-        if len(seed_ids) >= 2:
-            break
-    else:
-        return None
-
-    # Voronoi assignment: each original mask pixel → nearest eroded seed centroid.
-    # Build distance maps by treating each seed as the "foreground" and computing
-    # distance-to-nearest-seed-pixel for every point in the frame.
-    dist_maps = []
-    for sid in seed_ids:
-        seed_bin = (labels_e == sid).astype(np.uint8)
-        dist = cv2.distanceTransform((1 - seed_bin).astype(np.uint8), cv2.DIST_L2, 3)
-        dist_maps.append(dist)
-
-    dist_stack = np.stack(dist_maps, axis=0)          # (n_seeds, H, W)
-    assignment  = np.argmin(dist_stack, axis=0)       # H×W → seed index [0..n-1]
-
-    result = []
-    for idx in range(len(seed_ids)):
-        sub = ((m_np > 0) & (assignment == idx)).astype(np.uint8)
-        if int(sub.sum()) >= min_area:
-            result.append(sub)
-
-    return result if len(result) >= 2 else None
-
-
 def split_masks_by_separators(
-    frame_bgr:          np.ndarray,
-    masks_cuda:         list,
-    bboxes_xyxy:        list,
+    frame_bgr:   np.ndarray,
+    masks_cuda:  list,
+    bboxes_xyxy: list,
     *,
-    sep_thresh:         int,
-    min_area:           int,
-    dilate:             int  = 2,
-    use_col_cut:        bool = True,
-    use_proj_valley:    bool = True,
-    proj_valley_thresh: int  = 35,
-    use_erosion:        bool = True,
+    sep_thresh:  int,
+    min_area:    int,
+    dilate:      int = 2,
 ) -> tuple[list, list]:
     """
     Split merged FastSAM masks along near-black separator lines.
 
-    Two-stage approach:
-    1. Column/row mean separator detection — far more robust than per-pixel
-       thresholding because a single bright compression artifact cannot break
-       an otherwise-dark column's average.  Combined with per-pixel dark pixels
-       via union so we never lose existing coverage.
-    2. Erosion-based Voronoi fallback — when separator cutting still produces
-       only one component (e.g. the mask routes above/below the separator), we
-       progressively erode the mask until the bridge between two objects breaks,
-       use the resulting seeds, and Voronoi-expand each seed back into the
-       original mask.  This works purely on mask shape and needs no separator.
+    The source video is grayscale with each object bounded by a distinct
+    near-black line.  FastSAM frequently merges two touching objects into one
+    mask; cutting the mask at the dark separators and running connected-component
+    labelling recovers the individual objects so Re-ID can match a single one.
+
+    Parameters
+    ----------
+    frame_bgr   : np.ndarray  uint8 H×W×3  current frame.
+    masks_cuda  : list of float32 CUDA tensors, each H×W (full-frame).
+    bboxes_xyxy : list of (x1, y1, x2, y2) tuples, full-frame pixel coords.
+    sep_thresh  : pixels with grayscale intensity <= this are treated as
+                  separator lines (cut out of every mask).
+    min_area    : connected components smaller than this (in pixels) are
+                  discarded as noise.
+    dilate      : iterations of 3×3 dilation applied to the separator mask so
+                  anti-aliased line edges fully sever thin bridges.
+
+    Returns
+    -------
+    (masks_cuda, bboxes_xyxy) in the same format as the input.  A candidate that
+    yields <=1 surviving component is passed through unchanged (safe fallback).
     """
     import torch
 
     if not masks_cuda:
         return masks_cuda, bboxes_xyxy
 
-    gray   = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    H, W   = gray.shape
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    sep  = (gray <= int(sep_thresh)).astype(np.uint8)   # 1 where separator/black
     kernel = np.ones((3, 3), np.uint8)
-
-    # --- Stage 1: Dark Column Cut (optional) ---------------------------------
-    if use_col_cut:
-        sep = np.zeros((H, W), dtype=np.uint8)
-        col_means = gray.mean(axis=0)
-        sep[:, col_means <= sep_thresh] = 1
-        row_means = gray.mean(axis=1)
-        sep[row_means <= sep_thresh, :] = 1
-        sep = np.maximum(sep, (gray <= sep_thresh).astype(np.uint8))
-        sep = cv2.morphologyEx(sep, cv2.MORPH_CLOSE, kernel)
-        if dilate > 0:
-            sep = cv2.dilate(sep, kernel, iterations=int(dilate))
-    else:
-        sep = None
+    # Close before dilating: fills isolated bright pixels that interrupt the
+    # separator line in noisy/compressed video.  Without this, a single missed
+    # row in the separator leaves a horizontal bridge that connectedComponents
+    # always finds, regardless of connectivity setting.
+    sep = cv2.morphologyEx(sep, cv2.MORPH_CLOSE, kernel)
+    if dilate > 0:
+        sep = cv2.dilate(sep, kernel, iterations=int(dilate))
 
     out_masks:  list = []
     out_bboxes: list = []
 
     for m_cuda, box in zip(masks_cuda, bboxes_xyxy):
-        m_np_orig = (m_cuda > 0.5).to("cpu", torch.uint8).numpy()
+        # CUDA float32 mask → CPU uint8, then cut out separator pixels.
+        m_np = (m_cuda > 0.5).to("cpu", torch.uint8).numpy()
+        m_np[sep == 1] = 0
 
-        # --- Global separator cut (full-frame column/row means) ---
-        if use_col_cut and sep is not None:
-            m_np = m_np_orig.copy()
-            m_np[sep == 1] = 0
-        else:
-            m_np = m_np_orig.copy()
+        # connectivity=4: diagonal adjacency does NOT count as connected.
+        # With connectivity=8 a thin separator leaves diagonal corners that
+        # bridge the two objects; connectivity=4 prevents that entirely.
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            m_np, connectivity=4
+        )
 
-        # --- Local-bbox separator cut ------------------------------------
-        # Compute column/row means WITHIN this mask's bounding box only.
-        # A thin separator that's washed out in the full-frame average is
-        # dominant within the bbox where it spans the entire local height.
-        if use_col_cut:
-            ys, xs = np.where(m_np_orig > 0)
-            if len(xs) > 0:
-                bx0, bx1 = int(xs.min()), int(xs.max()) + 1
-                by0, by1 = int(ys.min()), int(ys.max()) + 1
-                if bx1 > bx0 and by1 > by0:
-                    roi = gray[by0:by1, bx0:bx1]
-                    local_col = roi.mean(axis=0)    # (roi_w,)
-                    local_row = roi.mean(axis=1)    # (roi_h,)
-                    local_sep = np.zeros((H, W), dtype=np.uint8)
-                    dark_c = (local_col <= sep_thresh).nonzero()[0] + bx0
-                    dark_r = (local_row <= sep_thresh).nonzero()[0] + by0
-                    if len(dark_c):
-                        local_sep[:, dark_c] = 1
-                    if len(dark_r):
-                        local_sep[dark_r, :] = 1
-                    if local_sep.any():
-                        local_sep = cv2.dilate(local_sep, kernel, iterations=int(dilate))
-                        m_np[local_sep == 1] = 0
-
-        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m_np, connectivity=4)
-        comps = [i for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+        # Label 0 is background; keep foreground components above min_area.
+        comps = [
+            i for i in range(1, n_labels)
+            if stats[i, cv2.CC_STAT_AREA] >= min_area
+        ]
 
         if len(comps) <= 1:
-            # --- Stage 2a: projection-valley split ---------------------------
-            sub_masks = _projection_valley_split(
-                m_np_orig, min_area,
-                max_ratio=proj_valley_thresh / 100.0,
-            ) if use_proj_valley else None
-
-            # --- Stage 2b: erosion-based Voronoi fallback --------------------
-            if not sub_masks and use_erosion:
-                sub_masks = _erosion_split(m_np_orig, min_area)
-            if sub_masks:
-                for sub in sub_masks:
-                    sub_t = torch.from_numpy(sub).float().to("cuda")
-                    x, y, bw, bh = cv2.boundingRect(sub)
-                    out_masks.append(sub_t)
-                    out_bboxes.append((float(x), float(y), float(x + bw), float(y + bh)))
-                continue
-
+            # Single object (or nothing significant) — keep the original mask.
             out_masks.append(m_cuda)
             out_bboxes.append(box)
             continue
 
         labels_cuda = torch.from_numpy(labels).to("cuda")
         for i in comps:
-            comp_mask = (labels_cuda == i).float()
+            comp_mask = (labels_cuda == i).float()   # H×W float32 CUDA
             x = int(stats[i, cv2.CC_STAT_LEFT])
             y = int(stats[i, cv2.CC_STAT_TOP])
             w = int(stats[i, cv2.CC_STAT_WIDTH])
@@ -702,20 +570,11 @@ class InferThread(threading.Thread):
             mode = "roi"
 
         # ── 2b. Split merged masks at black separator lines ───────────
-        any_split_on = (
-            self._cfg.get("separator_split",   True)
-            or self._cfg.get("proj_valley_split", True)
-            or self._cfg.get("erosion_split",     True)
-        )
-        if any_split_on and masks_cuda:
+        if self._cfg.get("separator_split", True) and masks_cuda:
             masks_cuda, bboxes_xyxy = split_masks_by_separators(
                 frame_bgr_np, masks_cuda, bboxes_xyxy,
-                sep_thresh        = int(self._cfg.get("separator_thresh",   40)),
-                min_area          = self._min_component_area,
-                use_col_cut       = bool(self._cfg.get("separator_split",   True)),
-                use_proj_valley   = bool(self._cfg.get("proj_valley_split", True)),
-                proj_valley_thresh= int(self._cfg.get("proj_valley_thresh", 35)),
-                use_erosion       = bool(self._cfg.get("erosion_split",     True)),
+                sep_thresh = int(self._cfg.get("separator_thresh", 40)),
+                min_area   = self._min_component_area,
             )
 
         # ── 2c. Reject background-scale masks ────────────────────────
@@ -1110,9 +969,6 @@ class GPUPipelineProcess(mp.Process):
         "total_frames":    0,
         "separator_split":         True,
         "separator_thresh":        40,
-        "proj_valley_split":       True,
-        "proj_valley_thresh":      35,
-        "erosion_split":           True,
         "min_component_area_frac": 0.30,
         "detection_mode":          False,
         "native_w":                0,   # 0 = same as vid_w (no upscale needed)
@@ -1246,15 +1102,11 @@ class GPUPipelineProcess(mp.Process):
 
         # Shared live config — mutated by the command loop below.
         live_cfg: dict = {
-            "match_threshold":    cfg["match_threshold"],
-            "overlay_alpha":      cfg["overlay_alpha"],
-            "stride":             cfg["stride"],
-            "separator_split":    cfg["separator_split"],
-            "separator_thresh":   cfg["separator_thresh"],
-            "proj_valley_split":  cfg.get("proj_valley_split",  True),
-            "proj_valley_thresh": cfg.get("proj_valley_thresh", 35),
-            "erosion_split":      cfg.get("erosion_split",      True),
-            "detection_mode":     cfg.get("detection_mode",     False),
+            "match_threshold":  cfg["match_threshold"],
+            "overlay_alpha":    cfg["overlay_alpha"],
+            "stride":           cfg["stride"],
+            "separator_split":  cfg["separator_split"],
+            "separator_thresh": cfg["separator_thresh"],
         }
 
         # ── Spawn stage threads ───────────────────────────────────────
@@ -1324,12 +1176,6 @@ class GPUPipelineProcess(mp.Process):
                 live_cfg["separator_split"] = bool(cmd.payload)
             elif cmd.type == "UPDATE_SEP_THRESH":
                 live_cfg["separator_thresh"] = max(0, int(cmd.payload))
-            elif cmd.type == "UPDATE_PROJ_VALLEY":
-                live_cfg["proj_valley_split"] = bool(cmd.payload)
-            elif cmd.type == "UPDATE_PROJ_VALLEY_THRESH":
-                live_cfg["proj_valley_thresh"] = max(5, min(80, int(cmd.payload)))
-            elif cmd.type == "UPDATE_EROSION_SPLIT":
-                live_cfg["erosion_split"] = bool(cmd.payload)
             elif cmd.type == "UPDATE_DETECTION_MODE":
                 live_cfg["detection_mode"] = bool(cmd.payload)
 
