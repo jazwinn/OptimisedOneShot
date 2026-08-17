@@ -1,10 +1,11 @@
-# OptimisedOneShot — One-Shot Video Object Segmentation
+# OneShotSeg
 
-Desktop application for real-time, one-shot video object segmentation on a single consumer GPU.
+Segment and track any object in a video or image from a **single user-drawn box** — no training
+data, no labels, no fine-tuning. Runs in real time on one consumer GPU.
 
 The user draws a bounding box around a target object on a paused frame; FastSAM generates candidate masks inside that box; the best mask is selected (optionally refined with positive/negative point clicks); a Re-ID embedding is computed; then a lightweight FastSAM + OSNet tracking pipeline follows the target across all remaining frames. The mask overlay is rendered in **cyan** throughout.
 
-![OptimisedOneShot detecting every apple matching a single registered target](assets/Demo.jpg)
+![OneShotSeg detecting every apple matching a single registered target](assets/Demo.jpg)
 
 *One shot, one click: a single apple is registered (thumbnail, top-left) and every other region in the image matching that appearance is segmented. Overlays trace the true mask contour.*
 
@@ -53,7 +54,7 @@ ffmpeg must be on `PATH` for NVENC/libx264 video export. Without it, `cv2.VideoW
 ## Project Structure
 
 ```
-OptimisedOneShot/
+OneShotSeg/
 ├── main.py       # Entry point: multiprocessing bootstrap, queue creation, Qt app
 ├── gui.py        # All Qt classes: VideoCanvas, ControlPanel, TimelinePanel,
 │                 # RegistrationThread, VideoReaderThread, FrameDisplayWorker,

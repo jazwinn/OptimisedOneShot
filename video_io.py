@@ -1,6 +1,6 @@
 """
-OptimisedOneShot — Video I/O Module
-=====================================
+OneShotSeg — Video I/O Module
+=============================
 NVDECReader   — Multi-backend video reader with automatic fallback chain.
 VideoWriter   — Multi-backend video writer (NVENC → libx264 → cv2 mp4v),
                 or cv2.imwrite when the output path is a still image.

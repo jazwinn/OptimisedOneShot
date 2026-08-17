@@ -1,4 +1,4 @@
-# OptimisedOneShot — Python Dependencies
+# OneShotSeg — Python Dependencies
 # ========================================
 # Install with:  pip install -r requirements.txt
 #

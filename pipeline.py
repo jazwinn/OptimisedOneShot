@@ -1,6 +1,6 @@
 """
-OptimisedOneShot — GPU Pipeline Process
-========================================
+OneShotSeg — GPU Pipeline Process
+=================================
 Three-stage producer-consumer pipeline running entirely inside a spawned
 child process so the GPU has its own CUDA context, isolated from the Qt
 main process.

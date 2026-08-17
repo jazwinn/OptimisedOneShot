@@ -1,6 +1,6 @@
 """
-OptimisedOneShot — Models Module
-==================================
+OneShotSeg — Models Module
+==========================
 All model wrappers, gallery logic, and the tracker:
 
   HeavySAMRegistrar  — SAM2 Large image predictor; loads/unloads on demand.

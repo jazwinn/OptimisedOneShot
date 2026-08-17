@@ -1,6 +1,6 @@
 """
-OptimisedOneShot — GUI Module
-=============================
+OneShotSeg — GUI Module
+=======================
 Contains every Qt class needed by the application:
 
   VideoCanvas          — QGraphicsView with letterboxed video, point-prompt
@@ -744,7 +744,7 @@ class ControlPanel(QWidget):
         root.setSpacing(6)
 
         # Title
-        title = QLabel("OptimisedOneShot")
+        title = QLabel("OneShotSeg")
         title.setFont(QFont("Segoe UI", 11, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         root.addWidget(title)
@@ -1606,7 +1606,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
 
-        self.setWindowTitle("OptimisedOneShot — Video Object Segmentation")
+        self.setWindowTitle("OneShotSeg — Video Object Segmentation")
         self.setMinimumSize(1200, 740)
         self.resize(1400, 860)
 

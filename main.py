@@ -1,6 +1,6 @@
 """
-OptimisedOneShot — One-Shot Video Object Segmentation
-======================================================
+OneShotSeg — One-Shot Video Object Segmentation
+===============================================
 Entry point. Responsibilities:
   1. Configure multiprocessing to use the 'spawn' start method (mandatory on
      Windows and required for CUDA safety across process boundaries).
@@ -100,8 +100,8 @@ def main() -> None:
     from gui import MainWindow
 
     app = QApplication(sys.argv)
-    app.setApplicationName("OptimisedOneShot")
-    app.setApplicationDisplayName("OptimisedOneShot")
+    app.setApplicationName("OneShotSeg")
+    app.setApplicationDisplayName("OneShotSeg")
     app.setStyle("Fusion")
 
     # Dark palette for a professional, low-distraction look.
