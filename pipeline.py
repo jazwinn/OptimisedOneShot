@@ -283,54 +283,47 @@ def _alpha_blend(frame_cuda, mask_cuda, alpha: float):
     return out.clamp_(0.0, 1.0)
 
 
-def _draw_quad_overlays(rgb_np: "np.ndarray", mask_np: "np.ndarray") -> None:
-    """
-    Fit a 4-corner polygon to each distinct blob in mask_np and draw it
-    in-place on rgb_np (H×W×3 uint8 RGB).
+#: Overlay colour, given in each buffer's own channel order.
+CYAN_RGB = (0, 230, 230)
+CYAN_BGR = (230, 230, 0)
 
-    For each blob:
-      • semi-transparent cyan fill
-      • solid cyan outline
-      • cyan corner circles
+#: Blobs smaller than this are noise, not objects.
+_MIN_CONTOUR_AREA = 200
+
+
+def _draw_mask_contours(
+    img_np:  "np.ndarray",
+    mask_np: "np.ndarray",
+    color:   tuple = CYAN_RGB,
+) -> None:
+    """
+    Draw the true outline of every blob in mask_np in-place on img_np.
+
+    Each blob gets a semi-transparent fill and a solid anti-aliased outline
+    that follows the segmentation exactly — no polygon simplification, so
+    round and irregular targets keep their real shape.
+
+    Parameters
+    ----------
+    img_np  : H×W×3 uint8, modified in place.
+    mask_np : H×W uint8 binary mask (0 / 255).
+    color   : overlay colour expressed in img_np's OWN channel order — pass
+              CYAN_RGB for an RGB buffer, CYAN_BGR for a BGR one.
     """
     import cv2
-    import numpy as np
-
-    MIN_AREA = 200   # ignore tiny noise blobs
 
     contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = [c for c in contours if cv2.contourArea(c) >= _MIN_CONTOUR_AREA]
+    if not contours:
+        return
 
-    for contour in contours:
-        if cv2.contourArea(contour) < MIN_AREA:
-            continue
+    # Semi-transparent fill — one blend for every blob rather than a
+    # full-frame copy per blob.
+    overlay = img_np.copy()
+    cv2.drawContours(overlay, contours, -1, color, cv2.FILLED)
+    cv2.addWeighted(overlay, 0.22, img_np, 0.78, 0, img_np)
 
-        # Fit quad: relax approxPolyDP until ≤4 corners.
-        hull = cv2.convexHull(contour)
-        arc  = cv2.arcLength(hull, True)
-        approx = hull
-        for eps in (0.02, 0.04, 0.06, 0.10, 0.15, 0.20, 0.30):
-            cand = cv2.approxPolyDP(hull, eps * arc, True)
-            approx = cand
-            if len(cand) <= 4:
-                break
-        if len(approx) == 4:
-            quad = approx.reshape(4, 2).astype(np.int32)
-        else:
-            rect = cv2.minAreaRect(contour)
-            quad = np.int32(np.round(cv2.boxPoints(rect)))
-
-        # Semi-transparent fill (blend 22% cyan over current pixels).
-        overlay = rgb_np.copy()
-        cv2.fillPoly(overlay, [quad], (0, 230, 230))   # RGB cyan
-        cv2.addWeighted(overlay, 0.22, rgb_np, 0.78, 0, rgb_np)
-
-        # Solid outline.
-        cv2.polylines(rgb_np, [quad], isClosed=True, color=(0, 230, 230), thickness=2)
-
-        # Corner circles.
-        for pt in quad:
-            cv2.circle(rgb_np, tuple(pt), 5, (0, 230, 230), -1)
-            cv2.circle(rgb_np, tuple(pt), 5, (255, 255, 255), 1)
+    cv2.drawContours(img_np, contours, -1, color, 2, lineType=cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
@@ -360,12 +353,12 @@ class DecodeThread(threading.Thread):
         super().__init__(daemon=True, name="DecodeThread")
         self._raw_q  = raw_frame_queue
         self._out_q  = decode_to_infer_q
-        self._stop   = stop_event
+        self._stop_event = stop_event
 
     def run(self) -> None:
         import torch
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 item = self._raw_q.get(timeout=0.1)
             except Exception:
@@ -448,7 +441,7 @@ class InferThread(threading.Thread):
         super().__init__(daemon=True, name="InferThread")
         self._in_q     = decode_to_infer_q
         self._out_q    = infer_to_blend_q
-        self._stop     = stop_event
+        self._stop_event = stop_event
         self._fsam     = fast_sam
         self._embedder = embedder
         self._gallery  = ema_gallery
@@ -475,7 +468,7 @@ class InferThread(threading.Thread):
     def run(self) -> None:
         import torch
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 item = self._in_q.get(timeout=0.1)
             except queue.Empty:
@@ -581,7 +574,7 @@ class InferThread(threading.Thread):
         # Masks covering more than 55% of the frame are overwhelmingly likely
         # to be the background or the whole scene — not an individual object.
         # Keeping them pollutes Re-ID: a black-background mask embeds similarly
-        # to any registration crop that had black fill for non-polygon pixels.
+        # to any registration crop that had black fill for non-object pixels.
         max_mask_pixels = int(H * W * 0.55)
         if masks_cuda:
             filtered = [
@@ -711,7 +704,7 @@ class BlendThread(threading.Thread):
         super().__init__(daemon=True, name="BlendThread")
         self._in_q        = infer_to_blend_q
         self._disp_q      = display_queue
-        self._stop        = stop_event
+        self._stop_event  = stop_event
         self._cfg         = live_cfg
         self._H           = vid_h
         self._W           = vid_w
@@ -738,11 +731,10 @@ class BlendThread(threading.Thread):
             and (self._native_h != self._H or self._native_w != self._W)
         )
         if needs_native:
-            self._native_cap = cv2.VideoCapture(self._video_path, cv2.CAP_MSMF)
-            if not self._native_cap.isOpened():
-                self._native_cap = cv2.VideoCapture(self._video_path)
+            from video_io import open_capture
+            self._native_cap = open_capture(self._video_path)
 
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 item = self._in_q.get(timeout=0.1)
             except queue.Empty:
@@ -833,13 +825,13 @@ class BlendThread(threading.Thread):
             .copy()
         )   # H×W×3 uint8 RGB, fully owned writable C-contiguous array
 
-        # ── Polygon overlay on each segmented blob ─────────────────────
+        # ── Contour overlay on each segmented blob ─────────────────────
         if accepted and mask_cuda is not None:
             mask_np = (
                 (mask_cuda > 0.5).byte().contiguous().cpu().numpy().copy()
                 .astype(np.uint8) * 255
             )
-            _draw_quad_overlays(out_rgb_np, mask_np)
+            _draw_mask_contours(out_rgb_np, mask_np, CYAN_RGB)
 
         raw_bytes = out_rgb_np.tobytes()
 
@@ -903,11 +895,12 @@ class BlendThread(threading.Thread):
                             .numpy()
                             .copy()
                         )
-                        # Draw polygon overlays on native frame too.
+                        # Draw contour overlays on the native frame too.  This
+                        # buffer is BGR, so the colour is given in BGR order —
+                        # channel-swapping the whole frame to correct the
+                        # overlay would invert the frame's own red and blue.
                         mask_up_np = (mask_up > 0.5).byte().cpu().numpy().astype(np.uint8) * 255
-                        _draw_quad_overlays(export_bgr_np, mask_up_np)
-                        # _draw_quad_overlays works on RGB; we have BGR — swap channels.
-                        export_bgr_np = cv2.cvtColor(export_bgr_np, cv2.COLOR_RGB2BGR)
+                        _draw_mask_contours(export_bgr_np, mask_up_np, CYAN_BGR)
                     else:
                         export_bgr_np = native_bgr
                     self._writer.write_frame(export_bgr_np)
@@ -1091,7 +1084,8 @@ class GPUPipelineProcess(mp.Process):
             # only if it was not supplied.
             total_frames = int(cfg.get("total_frames", 0) or 0)
             if total_frames <= 0:
-                probe = cv2.VideoCapture(cfg["video_path"])
+                from video_io import open_capture
+                probe = open_capture(cfg["video_path"])
                 total_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
                 probe.release()
 
@@ -1100,13 +1094,17 @@ class GPUPipelineProcess(mp.Process):
         infer_to_blend:  queue.Queue = queue.Queue(maxsize=3)
         stop_event = threading.Event()
 
-        # Shared live config — mutated by the command loop below.
+        # Shared live config — mutated by the command loop below.  Every key
+        # the worker threads read at run time must be seeded here: they see
+        # only live_cfg, never cfg, so a key omitted below silently falls back
+        # to its .get() default no matter what the caller configured.
         live_cfg: dict = {
             "match_threshold":  cfg["match_threshold"],
             "overlay_alpha":    cfg["overlay_alpha"],
             "stride":           cfg["stride"],
             "separator_split":  cfg["separator_split"],
             "separator_thresh": cfg["separator_thresh"],
+            "detection_mode":   cfg["detection_mode"],
         }
 
         # ── Spawn stage threads ───────────────────────────────────────

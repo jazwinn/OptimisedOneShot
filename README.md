@@ -4,6 +4,10 @@ Desktop application for real-time, one-shot video object segmentation on a singl
 
 The user draws a bounding box around a target object on a paused frame; FastSAM generates candidate masks inside that box; the best mask is selected (optionally refined with positive/negative point clicks); a Re-ID embedding is computed; then a lightweight FastSAM + OSNet tracking pipeline follows the target across all remaining frames. The mask overlay is rendered in **cyan** throughout.
 
+![OptimisedOneShot detecting every apple matching a single registered target](assets/Demo.jpg)
+
+*One shot, one click: a single apple is registered (thumbnail, top-left) and every other region in the image matching that appearance is segmented. Overlays trace the true mask contour.*
+
 ---
 
 ## Confirmed Environment
@@ -24,8 +28,12 @@ The user draws a bounding box around a target object on a paused frame; FastSAM 
 **Absent packages (fallbacks activate automatically):**
 - `decord` → video decode falls back to `cv2.CAP_MSMF` (Windows Media Foundation)
 - `torchaudio` → same fallback
-- `torchreid` → Re-ID falls back to ResNet18 with `fc=nn.Identity()` (512-d)
 - `triton` → `torch.compile` is skipped entirely; models run in eager mode
+
+`torchreid` 1.4.0 **is** installed (from the vendored `deep-person-reid/` source, with
+`pip install --no-deps --no-build-isolation .` — its own `requirements.txt` would otherwise
+pull `numpy`/`opencv-python`/`tb-nightly` and disturb the pinned versions above). Re-ID
+therefore runs on **OSNet-x0.25**; the ResNet18 `fc=nn.Identity()` path is fallback only.
 
 ---
 
@@ -62,42 +70,116 @@ OptimisedOneShot/
 
 ## Architecture Overview
 
-### Two-Process Topology
+### The Pipeline
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  MAIN PROCESS  ·  Qt Event Loop  ·  NO CUDA                         │
-│                                                                      │
-│  RegistrationThread (QThread)                                        │
-│    FastSAMTracker → predict_roi(bbox) → _pick_best_fastsam_mask()   │
-│    HeavySAMRegistrar._isolate_clicked_component() (static, no load) │
-│    ReIDEmbedder → reference embedding (D=512, L2-normalised)        │
-│    Unloads all models before GPU process starts                      │
-│                                                                      │
-│  VideoReaderThread (QThread)                                         │
-│    cv2.VideoCapture (CAP_MSMF) → raw_frame_queue                   │
-│    Modes: SEEK (scrub), PLAY (preview), START_TRACKING (GPU),       │
-│           STOP_TRACKING                                              │
-│                                                                      │
-│  FrameDisplayWorker (QThread)                                        │
-│    Drains display_queue → QPixmap → VideoCanvas                     │
-└──────────────────────────────────────────┬───────────────────────────┘
-                                           │  mp.Queue (CPU numpy bytes only)
-┌──────────────────────────────────────────▼───────────────────────────┐
-│  GPU PIPELINE PROCESS  ·  mp.Process(daemon=True, start='spawn')    │
-│  CUDA initialised in run(), NEVER in __init__                        │
-│  Sets os.environ['_OPTSHOT_GPU_PROC'] = '1' before any model load   │
-│                                                                      │
-│  DecodeThread  → raw_frame_queue → CUDA float32 3×H×W tensor       │
-│  InferThread   → TrackerMIL bbox → FastSAM ROI → OSNet embed        │
-│                → split_masks_by_separators() → EMA gallery match    │
-│                → gate (accept/reject) → (mask_cuda, meta)           │
-│  BlendThread   → _alpha_blend (cyan overlay) → CPU bytes            │
-│                → display_queue + export VideoWriter                  │
-└──────────────────────────────────────────────────────────────────────┘
+Register a target **once**, then every frame is segmented, matched against that
+single reference, and overlaid.
+
+```mermaid
+flowchart LR
+
+SRC(["Video<br>or image"])
+
+REG["<b>1 · Register</b><br>draw one box<br>→ FastSAM mask<br>→ OSNet embedding"]
+
+SEG["<b>2 · Segment</b><br>FastSAM finds every<br>candidate region"]
+MAT["<b>3 · Match</b><br>embed each candidate,<br>keep those close to<br>the reference"]
+OVL["<b>4 · Overlay</b><br>cyan contour on<br>every match"]
+
+OUT(["Screen<br>MP4 · PNG"])
+
+SRC --> REG
+SRC --> SEG
+REG -. "reference embedding<br><i>computed once</i>" .-> MAT
+SEG --> MAT --> OVL --> OUT
+
+classDef once fill:#1a6b3c,stroke:#5fd89f,stroke-width:2px,color:#fff
+classDef loop fill:#1a4b8c,stroke:#7fb3e8,stroke-width:2px,color:#fff
+classDef io   fill:#2e2e36,stroke:#9a9aa8,stroke-width:2px,color:#fff
+class REG once
+class SEG,MAT,OVL loop
+class SRC,OUT io
 ```
 
-### Cross-Process Queues (CPU data only — CUDA tensors never cross)
+🟩 runs **once**, at registration · 🟦 runs **per frame**
+
+| Step | Does | Key call |
+|---|---|---|
+| 1 · Register | Turns one user-drawn box into a 512-d appearance vector | `RegistrationThread` |
+| 2 · Segment | Proposes candidate regions — ROI around the tracker, or the whole frame in Detection Mode | `FastSAMTracker.predict_roi` / `predict_full` |
+| 3 · Match | Cosine-compares every candidate to the reference; keeps all above Match Threshold | `EMAGallery.all_matches_above_threshold` |
+| 4 · Overlay | OR's the accepted masks, alpha-blends cyan, traces contours | `BlendThread` |
+
+<details>
+<summary><b>Detailed thread &amp; queue topology</b> — click to expand</summary>
+
+One frame flows top to bottom. 🟦 **blue** = main process · 🟩 **green** = GPU process ·
+⬛ **dashed** = `mp.Queue` process boundary · 🟪 **purple** = file output.
+
+**Only CPU bytes cross a dashed node — CUDA tensors never do.**
+
+```mermaid
+flowchart TD
+
+SRC["<b>Source</b><br>video file or still image<br><i>video_io.open_capture()</i>"]
+
+REGT["<b>RegistrationThread</b> · QThread<br>FastSAM on the drawn bbox → best mask<br>→ OSNet reference embedding → unload models"]
+READ["<b>VideoReaderThread</b> · QThread<br>SEEK · PLAY · TRACK"]
+CTRL["<b>ControlPanel</b><br>threshold · alpha · stride · detection mode"]
+
+SRC --> REGT
+SRC --> READ
+
+Q2(["reg_result_queue"])
+Q1(["raw_frame_queue"])
+Q3(["pipeline_cmd_queue"])
+
+REGT --> Q2
+READ --> Q1
+CTRL --> Q3
+
+DEC["<b>DecodeThread</b><br>numpy BGR → CUDA float32 3×H×W"]
+INF["<b>InferThread</b><br>FastSAM ROI or full-frame<br>→ separator split → OSNet embed<br>→ EMA gallery gate"]
+BLN["<b>BlendThread</b><br>alpha blend + mask contours<br>→ CPU bytes"]
+
+Q1 --> DEC
+Q2 --> INF
+Q3 --> INF
+DEC -- "decode_to_infer_q" --> INF
+INF -- "infer_to_blend_q" --> BLN
+
+Q4(["display_queue"])
+OUT["<b>VideoWriter</b><br>.mp4 · .png"]
+BLN --> Q4
+BLN --> OUT
+
+DISP["<b>FrameDisplayWorker</b> · QThread"]
+CANV["<b>VideoCanvas</b><br>cyan contour overlay"]
+Q4 --> DISP --> CANV
+
+classDef main fill:#1a4b8c,stroke:#7fb3e8,stroke-width:2px,color:#fff
+classDef gpu  fill:#1a6b3c,stroke:#5fd89f,stroke-width:2px,color:#fff
+classDef q    fill:#2e2e36,stroke:#9a9aa8,stroke-width:2px,color:#fff,stroke-dasharray:5 3
+classDef sink fill:#5a3a6b,stroke:#c098e0,stroke-width:2px,color:#fff
+class SRC,READ,REGT,CTRL,DISP,CANV main
+class DEC,INF,BLN gpu
+class Q1,Q2,Q3,Q4 q
+class OUT sink
+```
+
+| Stage | Thread | Input → Output |
+|---|---|---|
+| Read | `VideoReaderThread` (QThread) | file → `raw_frame_queue` |
+| Register | `RegistrationThread` (QThread) | bbox + points → reference embedding (512-d, L2-normalised), then unloads all models |
+| Decode | `DecodeThread` | numpy BGR → CUDA float32 `3×H×W` in `[0,1]` |
+| Infer | `InferThread` | frame → candidate masks → embeddings → accept/reject vs EMA gallery |
+| Blend | `BlendThread` | frame + accepted masks → cyan composite → `display_queue` / `VideoWriter` |
+| Display | `FrameDisplayWorker` (QThread) | `display_queue` → `QPixmap` → canvas |
+
+CUDA is initialised inside `GPUPipelineProcess.run()`, never in `__init__`, and
+`os.environ['_OPTSHOT_GPU_PROC'] = '1'` is set before any model loads.
+
+**Cross-process queues** (CPU data only — CUDA tensors never cross):
 
 | Queue | maxsize | Payload |
 |---|---|---|
@@ -107,7 +189,9 @@ OptimisedOneShot/
 | `display_queue` | 3 | `(raw_bytes: bytes, W, H, frame_idx, meta: dict\|None)` |
 
 **`pipeline_cmd_queue` command types:**
-`STOP` · `UPDATE_THRESHOLD` · `UPDATE_ALPHA` · `UPDATE_STRIDE` · `UPDATE_SEP_SPLIT` · `UPDATE_SEP_THRESH`
+`STOP` · `UPDATE_THRESHOLD` · `UPDATE_ALPHA` · `UPDATE_STRIDE` · `UPDATE_SEP_SPLIT` · `UPDATE_SEP_THRESH` · `UPDATE_DETECTION_MODE`
+
+</details>
 
 ---
 
@@ -300,30 +384,46 @@ Designed for grayscale video where objects are separated by distinct near-black 
 
 ## InferThread Decision Flow (per frame)
 
+```mermaid
+flowchart TD
+
+A["Frame arrives from DecodeThread"] --> B{"Detection Mode?"}
+
+B -- "yes<br>(forced on for still images)" --> D["FastSAM.predict_full(frame)<br>whole frame, no tracker<br>mode = detect"]
+B -- "no" --> C{"stride: full-inference<br>frame?"}
+
+C -- "no" --> P["TrackerMIL.update()<br>propagate last mask<br>mode = propagate"] --> Z
+C -- "yes" --> E["TrackerMIL.update() → roi_xyxy"]
+
+E --> F{"tracker<br>confidence<br>&ge; 0.4?"}
+F -- "no" --> D
+F -- "yes" --> G["FastSAM.predict_roi(frame, roi_xyxy)<br>ROI = union of last accepted boxes<br>mode = roi"]
+
+D --> H
+G --> H["split_masks_by_separators()<br>→ expanded candidate list"]
+H --> I["reject masks &gt; 55% of frame<br>(background, not an object)"]
+I --> J["crop each candidate<br>→ ReIDEmbedder.embed_batch()"]
+J --> K["EMAGallery.all_matches_above_threshold()"]
+
+K --> L{"any sim &ge;<br>match_threshold?"}
+L -- "no" --> M["no_match_streak++<br>streak &gt; 5 → drop ROI memory<br>streak &ge; 30 → re-acquiring"] --> Z
+L -- "yes" --> N["OR together every accepted mask<br>EMAGallery.update() on the best<br>TrackerMIL.init() on the best box"] --> Z
+
+Z["→ BlendThread<br>(frame_cuda, mask_cuda, accepted, meta)"]
+
+classDef dec fill:#5a3a6b,stroke:#a878c8,color:#fff
+classDef act fill:#1a4b8c,stroke:#4a8fd8,color:#fff
+classDef ok  fill:#1a6b3c,stroke:#3fbf7f,color:#fff
+classDef bad fill:#6b2a2a,stroke:#c86868,color:#fff
+class B,C,F,L dec
+class A,D,E,G,H,I,J,K,P act
+class N,Z ok
+class M bad
 ```
-Frame arrives from DecodeThread
-    │
-    ├─ stride counter: is this a full-inference frame?
-    │       NO  → TrackerMIL.update() → propagate last mask → BlendThread
-    │
-    └─ YES → TrackerMIL.update() → roi_xyxy
-                │
-                ├─ FastSAM.predict_roi(frame, roi_xyxy) → candidate masks
-                │       EMPTY → predict_full() → re-acquisition mode
-                │
-                ├─ split_masks_by_separators()
-                │       → expanded candidate list
-                │
-                ├─ Crop each candidate → ReIDEmbedder.embed_batch()
-                │
-                ├─ EMAGallery.best_match() → (best_idx, sim)
-                │
-                ├─ sim >= match_threshold (0.85)?
-                │       NO  → no_match_streak++; if streak > 5: full-frame mode
-                │       YES → accepted=True; EMAGallery.update(); TrackerMIL.init()
-                │
-                └─ BlendThread ← (frame_cuda, mask_cuda, accepted, meta)
-```
+
+> **Note** — every accepted candidate is highlighted, not just the best one. The
+> masks are OR'd into a single overlay, so one registered target can reveal many
+> matching objects in the same frame.
 
 ---
 

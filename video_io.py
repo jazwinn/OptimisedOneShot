@@ -2,7 +2,19 @@
 OptimisedOneShot — Video I/O Module
 =====================================
 NVDECReader   — Multi-backend video reader with automatic fallback chain.
-VideoWriter   — Multi-backend video writer (NVENC → libx264 → cv2 mp4v).
+VideoWriter   — Multi-backend video writer (NVENC → libx264 → cv2 mp4v),
+                or cv2.imwrite when the output path is a still image.
+ImageCapture  — A single still image behind the cv2.VideoCapture API.
+open_capture  — Opens either a video or a still image as a frame source.
+
+Still images
+------------
+The app treats a still image as a one-frame video: open_capture() returns
+an ImageCapture for image extensions and a real cv2.VideoCapture otherwise,
+so every caller that scrubs, previews, registers, tracks or exports works
+unchanged for both.  Exporting a still source writes an image file rather
+than a one-frame MP4 — VideoWriter switches to its cv2_imwrite backend when
+output_path has an image extension.
 
 NVDECReader backend priority
 -----------------------------
@@ -44,6 +56,121 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Still-image sources
+# ---------------------------------------------------------------------------
+
+IMAGE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".bmp", ".webp",
+    ".tif", ".tiff", ".ppm", ".pgm", ".jp2",
+)
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+
+
+def _glob_filter(label: str, extensions) -> str:
+    """Build one Qt file-dialog filter clause, e.g. 'Images (*.png *.jpg)'."""
+    return f"{label} (" + " ".join(f"*{e}" for e in extensions) + ")"
+
+
+# Qt file-dialog filter strings, shared by every "open source" dialog.
+VIDEO_FILTER = _glob_filter("Video Files", VIDEO_EXTENSIONS)
+IMAGE_FILTER = _glob_filter("Image Files", IMAGE_EXTENSIONS)
+MEDIA_FILTER = _glob_filter("Video & Image Files", VIDEO_EXTENSIONS + IMAGE_EXTENSIONS)
+
+
+def is_image_path(path: str) -> bool:
+    """True if `path` looks like a still image rather than a video container."""
+    return bool(path) and os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS
+
+
+class ImageCapture:
+    """
+    A single still image wearing a cv2.VideoCapture costume.
+
+    Implements the subset of the VideoCapture API the app actually uses
+    (isOpened / get / set / read / release / grab) over a one-frame
+    "video", so every caller that scrubs, previews, registers, tracks or
+    exports works unchanged when handed a JPEG instead of an MP4.
+
+    Frame 0 is the image; reading past it returns (False, None) exactly
+    like the end of a video stream.
+    """
+
+    #: Reported FPS.  Arbitrary but non-zero — downstream code divides by it.
+    DEFAULT_FPS = 30.0
+
+    def __init__(self, path: str) -> None:
+        self.path   = path
+        self._frame = cv2.imread(path, cv2.IMREAD_COLOR)
+        self._pos   = 0
+
+    # -- VideoCapture-compatible API ------------------------------------
+
+    def isOpened(self) -> bool:                     # noqa: N802 — cv2 naming
+        return self._frame is not None
+
+    def get(self, prop: int) -> float:              # noqa: D102
+        if self._frame is None:
+            return 0.0
+        h, w = self._frame.shape[:2]
+        return {
+            cv2.CAP_PROP_FRAME_WIDTH:  float(w),
+            cv2.CAP_PROP_FRAME_HEIGHT: float(h),
+            cv2.CAP_PROP_FPS:          self.DEFAULT_FPS,
+            cv2.CAP_PROP_FRAME_COUNT:  1.0,
+            cv2.CAP_PROP_POS_FRAMES:   float(self._pos),
+        }.get(prop, 0.0)
+
+    def set(self, prop: int, value: float) -> bool:  # noqa: D102
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            self._pos = max(0, int(value))
+            return True
+        return False
+
+    def read(self):
+        """Return (True, frame_copy) for frame 0, (False, None) afterwards."""
+        if self._frame is None or self._pos != 0:
+            self._pos += 1
+            return False, None
+        self._pos = 1
+        return True, self._frame.copy()
+
+    def grab(self) -> bool:                          # noqa: D102
+        ok, _ = self.read()
+        return ok
+
+    def release(self) -> None:
+        self._frame = None
+
+    def __enter__(self) -> "ImageCapture":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.release()
+
+
+def open_capture(path: str):
+    """
+    Open `path` as a frame source and return a cv2.VideoCapture-compatible
+    object.
+
+    Still images yield an :class:`ImageCapture`; videos yield a real
+    cv2.VideoCapture opened with hardware-accelerated MSMF where possible,
+    falling back to OpenCV's default backend.
+
+    The result may be closed (``isOpened() == False``) — callers check, as
+    they already do for cv2.VideoCapture.
+    """
+    if is_image_path(path):
+        return ImageCapture(path)
+
+    cap = cv2.VideoCapture(path, cv2.CAP_MSMF)
+    if not cap.isOpened():
+        cap.release()
+        cap = cv2.VideoCapture(path)
+    return cap
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +543,13 @@ class VideoWriter:
         if parent:
             os.makedirs(parent, exist_ok=True)
 
+        # Still-image output — no encoder involved; each frame is written
+        # straight to disk by write_frame().
+        if is_image_path(self.output_path):
+            self._backend = "cv2_imwrite"
+            logger.info("VideoWriter: cv2.imwrite (still image output)")
+            return
+
         if self._probe_nvenc():
             if self._try_ffmpeg("h264_nvenc", extra_opts={"preset": "p4", "rc": "vbr", "cq": "23"}):
                 logger.info("VideoWriter: ffmpeg h264_nvenc (NVENC GPU encode)")
@@ -455,6 +589,8 @@ class VideoWriter:
                 self._write_ffmpeg(frame_bgr)
             elif self._backend == "cv2_mp4v":
                 self._cv2_writer.write(frame_bgr)
+            elif self._backend == "cv2_imwrite":
+                self._write_image(frame_bgr)
             self._frame_count += 1
 
     def close(self) -> None:
@@ -559,6 +695,28 @@ class VideoWriter:
             )
         except Exception as exc:
             logger.error("ffmpeg write error: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Backend: still image (cv2.imwrite)
+    # ------------------------------------------------------------------
+
+    def _write_image(self, frame_bgr: np.ndarray) -> None:
+        """
+        Write one composited frame to disk as a still image.
+
+        The first frame takes the requested output path.  A still-image
+        source yields exactly one frame, so subsequent frames only appear
+        if this writer was pointed at an image path by mistake — those get
+        a numeric suffix rather than silently overwriting the first.
+        """
+        if self._frame_count == 0:
+            path = self.output_path
+        else:
+            stem, ext = os.path.splitext(self.output_path)
+            path = f"{stem}_{self._frame_count:05d}{ext}"
+
+        if not cv2.imwrite(path, frame_bgr):
+            logger.error("cv2.imwrite failed for '%s'.", path)
 
     # ------------------------------------------------------------------
     # Backend: cv2.VideoWriter

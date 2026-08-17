@@ -10,7 +10,7 @@ Contains every Qt class needed by the application:
                          threshold/alpha/stride controls, export.
   RegistrationThread   — QThread that runs heavy SAM2 + ReID embedding in
                          one shot, then unloads models from VRAM.
-  VideoReaderThread    — QThread driving cv2.VideoCapture; dual-mode: preview
+  VideoReaderThread    — QThread driving the frame source; dual-mode: preview
                          (single-frame seek) and tracking (continuous feed into
                          raw_frame_queue).
   FrameDisplayWorker   — QThread that drains display_queue from the GPU
@@ -18,6 +18,14 @@ Contains every Qt class needed by the application:
                          signals for VideoCanvas to render.
   MainWindow           — Top-level orchestrator: wires all threads/processes,
                          manages state machine, routes signals.
+
+Sources
+-------
+The app accepts a video file or a single still image.  Every frame read goes
+through video_io.open_capture(), which returns a cv2.VideoCapture for videos
+and a one-frame ImageCapture for images, so the scrub → register → track →
+export flow is identical for both.  MainWindow._is_image only affects wording,
+the timeline controls, and the export file type (still source → image file).
 
 Threading contract
 ------------------
@@ -27,8 +35,8 @@ Threading contract
 * No torch or CUDA calls occur in the main Qt thread. All GPU work is
   delegated to RegistrationThread (Phase 1, once) or the spawned
   GPUPipelineProcess (Phase 2, continuous).
-* cv2.VideoCapture is owned exclusively by VideoReaderThread; no other thread
-  touches it.
+* The long-lived capture is owned exclusively by VideoReaderThread; no other
+  thread touches it.  Other readers open their own short-lived capture.
 """
 
 from __future__ import annotations
@@ -42,6 +50,14 @@ from typing import Any, NamedTuple, Optional
 
 import cv2
 import numpy as np
+
+from video_io import (
+    IMAGE_FILTER,
+    MEDIA_FILTER,
+    VIDEO_FILTER,
+    is_image_path,
+    open_capture,
+)
 
 from qtpy.QtCore import (
     QPointF,
@@ -61,6 +77,7 @@ from qtpy.QtGui import (
     QPainter,
     QPen,
     QPixmap,
+    QPolygonF,
 )
 from qtpy.QtWidgets import (
     QApplication,
@@ -88,6 +105,12 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+# Blobs smaller than this are noise, not objects.  Mirrors
+# pipeline._MIN_CONTOUR_AREA — the two processes render overlays independently
+# and pipeline.py is never imported at module scope here.
+_MIN_CONTOUR_AREA = 200
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +191,6 @@ class VideoCanvas(QGraphicsView):
         self._reg_bbox: Optional[tuple[float, float, float, float]] = None  # xyxy
         self._dragging: bool = False
         self._drag_origin: Optional[QPointF] = None
-        # 4-corner polygon fitted to the live mask (set by MaskPreviewThread result)
-        self._reg_quad: Optional[np.ndarray] = None   # (4, 2) int32
 
         # Embedding preview overlay — shown top-right after registration
         self._thumb_widget = QWidget(self)
@@ -241,28 +262,21 @@ class VideoCanvas(QGraphicsView):
     def set_mask_overlay(self, mask: Optional[np.ndarray]) -> None:
         """Set a mask (H×W uint8) as the semi-transparent overlay. Pass None to clear."""
         self._mask_overlay = mask
-        self._reg_quad = None   # raw mask replaces any existing quad
-        if self._current_pixmap is not None:
-            self._render_with_overlay(self._current_pixmap)
-
-    def set_quad_overlay(self, quad_pts: Optional[np.ndarray]) -> None:
-        """Replace the raw mask fill with a fitted 4-corner polygon overlay.
-
-        quad_pts: (4, 2) int32 array of corner coordinates in frame space, or None to clear.
-        """
-        self._reg_quad = quad_pts
-        self._mask_overlay = None   # polygon replaces the blob fill
         if self._current_pixmap is not None:
             self._render_with_overlay(self._current_pixmap)
 
     def clear_prompts(self) -> None:
-        """Remove all prompt points, bounding box, mask overlay, and quad polygon."""
+        """
+        Remove all prompt points, bounding box, mask overlay and the
+        registered-target thumbnail — everything the user built up on top
+        of the frame.
+        """
         self._prompt_points.clear()
         self._mask_overlay = None
-        self._reg_quad = None
         self._reg_bbox = None
         self._dragging = False
         self._drag_origin = None
+        self._thumb_widget.hide()
         if self._current_pixmap is not None:
             self._render_with_overlay(self._current_pixmap)
 
@@ -303,10 +317,9 @@ class VideoCanvas(QGraphicsView):
     # ------------------------------------------------------------------
 
     def _render_with_overlay(self, base_pixmap: QPixmap) -> None:
-        """Paint mask overlay, quad polygon, bounding box, and prompt dots onto base_pixmap."""
+        """Paint mask overlay, bounding box, and prompt dots onto base_pixmap."""
         nothing_to_draw = (
             self._mask_overlay is None
-            and self._reg_quad is None
             and not self._prompt_points
             and self._reg_bbox is None
         )
@@ -318,8 +331,8 @@ class VideoCanvas(QGraphicsView):
         painter = QPainter(result)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # --- Raw mask overlay (cyan blob, shown when no quad fitted yet) -----
-        if self._mask_overlay is not None and self._reg_quad is None:
+        # --- Mask overlay: translucent fill + the mask's true contour -------
+        if self._mask_overlay is not None:
             mask = self._mask_overlay
             mh, mw = mask.shape[:2]
             overlay_rgba = np.zeros((mh, mw, 4), dtype=np.uint8)
@@ -329,49 +342,22 @@ class VideoCanvas(QGraphicsView):
             overlay_img = QImage(_overlay_buf, mw, mh, 4 * mw, QImage.Format_RGBA8888)
             painter.drawImage(0, 0, overlay_img)
 
-            # Contour outline
+            # Outline every blob along its true contour — no polygon fitting,
+            # so round and irregular targets keep their real shape.
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-            pen = QPen(QColor(0, 210, 210), 2.0)
+            pen = QPen(QColor(0, 230, 230), 2.0)
             pen.setCosmetic(True)
+            pen.setJoinStyle(Qt.RoundJoin)
             painter.setPen(pen)
-            for contour in contours:
-                pts = [QPointF(float(p[0][0]), float(p[0][1])) for p in contour]
-                n = len(pts)
-                if n > 1:
-                    for i in range(n - 1):
-                        painter.drawLine(pts[i], pts[i + 1])
-                    painter.drawLine(pts[-1], pts[0])
-
-        # --- 4-corner polygon (replaces raw mask once quad is computed) ------
-        if self._reg_quad is not None:
-            pts_np = self._reg_quad   # (4, 2) int32
-            h_px = base_pixmap.height()
-            w_px = base_pixmap.width()
-
-            # Semi-transparent cyan fill via numpy → QImage overlay
-            poly_rgba = np.zeros((h_px, w_px, 4), dtype=np.uint8)
-            cv2.fillPoly(poly_rgba, [pts_np], (0, 210, 210, 80))
-            _poly_buf = poly_rgba.tobytes()
-            poly_img = QImage(_poly_buf, w_px, h_px, 4 * w_px, QImage.Format_RGBA8888)
-            painter.drawImage(0, 0, poly_img)
-
-            # Solid cyan outline
-            outline_pen = QPen(QColor(0, 230, 230), 2.5)
-            outline_pen.setCosmetic(True)
-            painter.setPen(outline_pen)
             painter.setBrush(Qt.NoBrush)
-            qpts = [QPointF(float(p[0]), float(p[1])) for p in pts_np]
-            n = len(qpts)
-            for i in range(n):
-                painter.drawLine(qpts[i], qpts[(i + 1) % n])
-
-            # Corner circles
-            painter.setBrush(QBrush(QColor(0, 230, 230)))
-            painter.setPen(QPen(QColor(255, 255, 255), 1.5))
-            for p in qpts:
-                painter.drawEllipse(p, 5.0, 5.0)
+            for contour in contours:
+                if cv2.contourArea(contour) < _MIN_CONTOUR_AREA:
+                    continue
+                painter.drawPolygon(QPolygonF(
+                    [QPointF(float(p[0][0]), float(p[0][1])) for p in contour]
+                ))
 
         # --- Bounding box (dashed cyan) -----------------------------------
         if self._reg_bbox is not None:
@@ -562,9 +548,11 @@ class TimelinePanel(QWidget):
 
     def set_video_info(self, total_frames: int, fps: float) -> None:
         self._total_frames = max(1, total_frames)
+        # A single still image has nothing to scrub or play through.
+        multi_frame = self._total_frames > 1
         self.slider.setMaximum(self._total_frames - 1)
-        self.slider.setEnabled(True)
-        self.play_btn.setEnabled(True)
+        self.slider.setEnabled(multi_frame)
+        self.play_btn.setEnabled(multi_frame)
         self.frame_label.setText(f"0 / {self._total_frames - 1}")
 
     def update_position(self, frame_idx: int) -> None:
@@ -640,7 +628,7 @@ class ControlPanel(QWidget):
     fastsam_weights_changed = Signal(str)
     reid_weights_changed   = Signal(str)
 
-    threshold_changed = Signal(float)   # match threshold 0.50–0.99
+    threshold_changed = Signal(float)   # match threshold 0.00–0.99
     alpha_changed     = Signal(float)   # overlay opacity 0.10–0.90
     stride_changed    = Signal(int)     # inference stride (every N frames)
     live_preview_toggled = Signal(bool)
@@ -649,9 +637,18 @@ class ControlPanel(QWidget):
     detection_mode_toggled = Signal(bool)  # skip tracker, full-frame detect every frame
     max_height_changed     = Signal(int)   # 0 = native, else max frame height
 
+    _DETECTION_MODE_TIP = (
+        "Skip the tracker entirely. Run full-frame FastSAM on every frame "
+        "and match against the registered embedding — like a per-frame detector. "
+        "More accurate for fast/erratic motion; slower than tracking mode."
+    )
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setFixedWidth(290)
+        # User's own detection-mode choice, preserved across image sources
+        # which force the setting on.
+        self._detection_mode_saved = False
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -672,6 +669,39 @@ class ControlPanel(QWidget):
     def set_tracking_active(self, active: bool) -> None:
         self.track_btn.setEnabled(not active)
         self.stop_btn.setEnabled(active)
+
+    def set_source_is_image(self, is_image: bool) -> None:
+        """
+        Adapt the controls to the kind of source loaded.
+
+        A still image has no motion to track, and the tracker is seeded from
+        the frame the target was registered on — so ROI mode would only ever
+        re-find the object the user already outlined.  Detection mode is the
+        only setting that answers the actual question ("what else in this
+        image looks like my target?"), so it is forced on and locked.
+        """
+        self.export_btn.setText(
+            "⬇  Export Rendered Image…" if is_image else "⬇  Export Rendered Video…"
+        )
+        self.track_btn.setText(
+            "▶  Detect Matches" if is_image else "▶  Start Live Preview"
+        )
+
+        self.detection_mode_check.blockSignals(True)
+        if is_image:
+            self._detection_mode_saved = self.detection_mode_check.isChecked()
+            self.detection_mode_check.setChecked(True)
+            self.detection_mode_check.setEnabled(False)
+            self.detection_mode_check.setToolTip(
+                "Always on for a single image: there is nothing to track, so the "
+                "whole frame is segmented and every region matching the registered "
+                "target is highlighted."
+            )
+        else:
+            self.detection_mode_check.setChecked(self._detection_mode_saved)
+            self.detection_mode_check.setEnabled(True)
+            self.detection_mode_check.setToolTip(self._DETECTION_MODE_TIP)
+        self.detection_mode_check.blockSignals(False)
 
     def get_fastsam_weights(self) -> str:
         return self.fastsam_path_edit.text().strip()
@@ -719,13 +749,13 @@ class ControlPanel(QWidget):
         title.setAlignment(Qt.AlignCenter)
         root.addWidget(title)
 
-        # ── Video ────────────────────────────────────────────────────
-        root.addWidget(self._make_separator("Video"))
-        self.load_btn = QPushButton("Load Video…")
+        # ── Source ───────────────────────────────────────────────────
+        root.addWidget(self._make_separator("Source"))
+        self.load_btn = QPushButton("Load Video / Image…")
         self.load_btn.clicked.connect(self._on_load_clicked)
         root.addWidget(self.load_btn)
 
-        self.video_label = QLabel("No video loaded.")
+        self.video_label = QLabel("No source loaded.")
         self.video_label.setWordWrap(True)
         self.video_label.setStyleSheet("color: #888; font-size: 10px;")
         root.addWidget(self.video_label)
@@ -788,10 +818,14 @@ class ControlPanel(QWidget):
         thr_row = QHBoxLayout()
         thr_row.addWidget(QLabel("Match Threshold:"))
         self.threshold_spin = QDoubleSpinBox()
-        self.threshold_spin.setRange(0.50, 0.99)
+        self.threshold_spin.setRange(0.00, 0.99)
         self.threshold_spin.setSingleStep(0.01)
         self.threshold_spin.setValue(0.65)
         self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setToolTip(
+            "Cosine similarity a candidate must reach to be accepted.\n"
+            "0.00 accepts every candidate region FastSAM produces."
+        )
         self.threshold_spin.valueChanged.connect(self.threshold_changed)
         thr_row.addWidget(self.threshold_spin)
         root.addLayout(thr_row)
@@ -877,12 +911,8 @@ class ControlPanel(QWidget):
         # Detection mode — skip tracker, full-frame FastSAM every frame
         self.detection_mode_check = QCheckBox("Detection Mode (no tracker)")
         self.detection_mode_check.setChecked(False)
-        self.detection_mode_check.setToolTip(
-            "Skip the tracker entirely. Run full-frame FastSAM on every frame "
-            "and match against the registered embedding — like a per-frame detector. "
-            "More accurate for fast/erratic motion; slower than tracking mode."
-        )
-        self.detection_mode_check.toggled.connect(self.detection_mode_toggled)
+        self.detection_mode_check.setToolTip(self._DETECTION_MODE_TIP)
+        self.detection_mode_check.toggled.connect(self._on_detection_mode_toggled)
         root.addWidget(self.detection_mode_check)
 
         # ── Execution ─────────────────────────────────────────────────
@@ -910,7 +940,7 @@ class ControlPanel(QWidget):
 
         # ── Status ────────────────────────────────────────────────────
         root.addStretch(1)
-        self.status_label = QLabel("Load a video to begin.")
+        self.status_label = QLabel("Load a video or image to begin.")
         self.status_label.setWordWrap(True)
         self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.status_label.setStyleSheet("color: #aaa; font-size: 10px;")
@@ -931,13 +961,19 @@ class ControlPanel(QWidget):
     def _on_load_clicked(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open Video File",
+            "Open Video or Image File",
             "",
-            "Video Files (*.mp4 *.mov *.avi *.mkv *.webm);;All Files (*)",
+            ";;".join((MEDIA_FILTER, VIDEO_FILTER, IMAGE_FILTER, "All Files (*)")),
         )
         if path:
             self.video_label.setText(os.path.basename(path))
             self.load_video_requested.emit(path)
+
+    def _on_detection_mode_toggled(self, enabled: bool) -> None:
+        # Remember the user's own choice so a still image (which forces the
+        # setting on) does not overwrite it when a video is loaded next.
+        self._detection_mode_saved = enabled
+        self.detection_mode_toggled.emit(enabled)
 
     def _browse_weight(self, line_edit: QLineEdit) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -964,7 +1000,7 @@ class MaskPreviewThread(QThread):
     the bounding box or adds / removes prompt points.
     """
 
-    preview_ready = Signal(object, tuple, object)   # (mask_np H×W uint8*255, bbox_xywh, quad_pts|(4,2)int32|None)
+    preview_ready = Signal(object, tuple)   # (mask_np H×W uint8*255, bbox_xywh)
     preview_error = Signal(str)
     progress      = Signal(str)
 
@@ -997,9 +1033,7 @@ class MaskPreviewThread(QThread):
     def _run_inner(self) -> None:
         from models import FastSAMTracker, HeavySAMRegistrar, _pick_best_fastsam_mask
 
-        cap = cv2.VideoCapture(self._video_path, cv2.CAP_MSMF)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(self._video_path)
+        cap = open_capture(self._video_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_idx)
         ret, frame_bgr = cap.read()
         cap.release()
@@ -1041,10 +1075,7 @@ class MaskPreviewThread(QThread):
             bx2, by2 = int(xs.max()) + 1, int(ys.max()) + 1
             bbox_xywh = (bx1, by1, bx2 - bx1, by2 - by1)
 
-        from models import _mask_to_quad
-        quad_pts = _mask_to_quad(best_mask_np)
-
-        self.preview_ready.emit(best_mask_np * 255, bbox_xywh, quad_pts)
+        self.preview_ready.emit(best_mask_np * 255, bbox_xywh)
 
 
 # ---------------------------------------------------------------------------
@@ -1083,7 +1114,6 @@ class RegistrationThread(QThread):
         separator_thresh: int = 40,
         precomputed_mask: Optional[np.ndarray] = None,
         precomputed_bbox: Optional[tuple] = None,
-        precomputed_quad: Optional[np.ndarray] = None,
         max_height: int = 0,
         parent: Optional[QWidget] = None,
     ) -> None:
@@ -1097,7 +1127,6 @@ class RegistrationThread(QThread):
         self._separator_thresh = separator_thresh
         self._precomputed_mask = precomputed_mask   # H×W uint8 *255, from MaskPreviewThread
         self._precomputed_bbox = precomputed_bbox   # (x, y, w, h)
-        self._precomputed_quad = precomputed_quad   # (4, 2) int32, from MaskPreviewThread
         self._max_height       = max_height
 
     def run(self) -> None:
@@ -1126,9 +1155,7 @@ class RegistrationThread(QThread):
 
         # ── Read target frame ────────────────────────────────────────
         self.progress.emit("Reading frame…")
-        cap = cv2.VideoCapture(self._video_path, cv2.CAP_MSMF)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(self._video_path)
+        cap = open_capture(self._video_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_idx)
         ret, frame_bgr = cap.read()
         cap.release()
@@ -1193,25 +1220,19 @@ class RegistrationThread(QThread):
 
         fh, fw = frame_bgr.shape[:2]
 
-        # Determine the quad to use: prefer precomputed; fall back to bbox rect.
-        quad = self._precomputed_quad
-        if quad is None and best_mask_np is not None:
-            from models import _mask_to_quad
-            quad = _mask_to_quad(best_mask_np)
-
-        if quad is not None:
-            # Crop to the polygon's axis-aligned bounding rect, then zero
-            # pixels outside the polygon so Re-ID focuses on the object shape.
-            qx, qy, qw, qh = cv2.boundingRect(quad)
-            x1 = max(0, qx)
-            y1 = max(0, qy)
-            x2 = min(fw, qx + qw)
-            y2 = min(fh, qy + qh)
-            poly_mask = np.zeros((fh, fw), dtype=np.uint8)
-            cv2.fillPoly(poly_mask, [quad], 255)
-            crop_roi    = frame_bgr[y1:y2, x1:x2].copy()
-            mask_roi    = poly_mask[y1:y2, x1:x2].astype(bool)
-            # Fill non-polygon pixels with the mean object colour so the Re-ID
+        # Build the reference crop from the mask itself.  The pipeline embeds
+        # candidates the same way (_crop_bgr with their own mask), so reference
+        # and candidates are shaped consistently — fitting a polygon here would
+        # pull background corners into the reference for any non-boxy target.
+        if best_mask_np is not None and best_mask_np.any():
+            mx, my, mw_, mh_ = cv2.boundingRect(best_mask_np.astype(np.uint8))
+            x1 = max(0, mx)
+            y1 = max(0, my)
+            x2 = min(fw, mx + mw_)
+            y2 = min(fh, my + mh_)
+            crop_roi = frame_bgr[y1:y2, x1:x2].copy()
+            mask_roi = best_mask_np[y1:y2, x1:x2].astype(bool)
+            # Fill non-object pixels with the mean object colour so the Re-ID
             # embedding is not biased toward black (which the background shares).
             if mask_roi.any():
                 mean_col = crop_roi[mask_roi].mean(axis=0).astype(np.uint8)
@@ -1328,12 +1349,11 @@ class VideoReaderThread(QThread):
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        # Open capture with hardware-accelerated MSMF on Windows; fallback to FFMPEG.
-        cap = cv2.VideoCapture(self._path, cv2.CAP_MSMF)
+        # Video → hardware-accelerated MSMF with FFMPEG fallback.
+        # Still image → one-frame ImageCapture with the same API.
+        cap = open_capture(self._path)
         if not cap.isOpened():
-            cap = cv2.VideoCapture(self._path)
-        if not cap.isOpened():
-            self.reader_error.emit(f"Cannot open video: {self._path}")
+            self.reader_error.emit(f"Cannot open source: {self._path}")
             return
 
         fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -1546,6 +1566,7 @@ class MainWindow(QMainWindow):
 
         # Application state
         self._video_path:   Optional[str]  = None
+        self._is_image:     bool           = False   # source is a still image
         self._total_frames: int            = 0
         self._video_fps:    float          = 30.0
         self._vid_w:        int            = 1280
@@ -1554,6 +1575,7 @@ class MainWindow(QMainWindow):
         self._native_h:     int            = 720
         self._current_frame_idx: int       = 0
         self._reg_result:   Optional[dict] = None
+        self._reg_cancelled: bool          = False  # discard the in-flight registration
 
         # Worker references
         self._reg_thread:     Optional[RegistrationThread]  = None
@@ -1565,7 +1587,6 @@ class MainWindow(QMainWindow):
         # Live mask preview state (populated by MaskPreviewThread)
         self._live_mask:      Optional[np.ndarray] = None
         self._live_bbox_xywh: Optional[tuple]      = None
-        self._live_quad:      Optional[np.ndarray] = None   # (4, 2) int32
 
         # Debounce timer — fires 400 ms after the last bbox/point change
         self._preview_debounce = QTimer()
@@ -1621,7 +1642,7 @@ class MainWindow(QMainWindow):
         # ── Status bar ────────────────────────────────────────────────
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
-        self._status_bar.showMessage("Ready — load a video to begin.")
+        self._status_bar.showMessage("Ready — load a video or image to begin.")
 
     def _connect_signals(self) -> None:
         cp = self.control
@@ -1657,12 +1678,12 @@ class MainWindow(QMainWindow):
 
     def _on_load_video(self, path: str) -> None:
         self._video_path = path
+        self._is_image    = is_image_path(path)
+        kind              = "image" if self._is_image else "video"
 
-        cap = cv2.VideoCapture(path, cv2.CAP_MSMF)
+        cap = open_capture(path)
         if not cap.isOpened():
-            cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            self._show_error(f"Cannot open video:\n{path}")
+            self._show_error(f"Cannot open {kind}:\n{path}")
             return
 
         native_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1677,7 +1698,7 @@ class MainWindow(QMainWindow):
         cap.release()
 
         if not ret:
-            self._show_error("Video file appears to be empty or unreadable.")
+            self._show_error(f"The {kind} file appears to be empty or unreadable.")
             return
 
         # Apply resolution cap — all downstream processing uses the scaled size.
@@ -1685,6 +1706,12 @@ class MainWindow(QMainWindow):
         frame = _fit_frame(frame, max_h)
         self._vid_w = frame.shape[1]
         self._vid_h = frame.shape[0]
+
+        # A new source invalidates any target registered against the old one.
+        self._reg_result = None
+        self._live_mask = None
+        self._live_bbox_xywh = None
+        self._reg_cancelled = self._reg_thread is not None and self._reg_thread.isRunning()
 
         self._current_frame_idx = 0
         self.canvas.set_video_size(self._vid_w, self._vid_h)
@@ -1698,14 +1725,19 @@ class MainWindow(QMainWindow):
         self.control.set_register_enabled(True)
         self.control.clear_pts_btn.setEnabled(True)
         self.control.set_track_controls_enabled(False)
+        self.control.set_source_is_image(self._is_image)
         res_note = (
             f" (native {native_w}×{native_h})" if (native_w != self._vid_w or native_h != self._vid_h) else ""
         )
-        self.control.set_status(
-            f"{self._vid_w}×{self._vid_h}{res_note}  ·  {self._video_fps:.2f} fps  ·  "
-            f"{self._total_frames} frames"
+        detail = (
+            "single image" if self._is_image
+            else f"{self._video_fps:.2f} fps  ·  {self._total_frames} frames"
         )
-        self._status_bar.showMessage("Video loaded. Drag to draw a bounding box around the target, then click Register.")
+        self.control.set_status(f"{self._vid_w}×{self._vid_h}{res_note}  ·  {detail}")
+        self._status_bar.showMessage(
+            f"{'Image' if self._is_image else 'Video'} loaded. "
+            "Drag to draw a bounding box around the target, then click Register."
+        )
 
         # Start reader thread for scrubbing
         self._start_reader_thread()
@@ -1747,10 +1779,32 @@ class MainWindow(QMainWindow):
         if self._preview_thread and self._preview_thread.isRunning():
             self._preview_thread.quit()
             self._preview_thread.wait(500)
+
+        # A reset invalidates the registered target, so anything running off it
+        # has to come down first.
+        if self._gpu_process is not None and self._gpu_process.is_alive():
+            self._on_stop_tracking()
+
+        # A registration already in flight would deliver the target we are
+        # clearing and put the canvas straight back into 'tracking' mode.
+        # Flag it so its result is discarded on arrival; the thread still runs
+        # to completion so it unloads its models from VRAM.
+        reg_in_flight = self._reg_thread is not None and self._reg_thread.isRunning()
+        self._reg_cancelled = reg_in_flight
+
         self._live_mask = None
         self._live_bbox_xywh = None
-        self._live_quad = None
+        self._reg_result = None
+
         self.canvas.clear_prompts()
+        # Registration set the canvas to 'tracking' mode, which ignores clicks —
+        # go back to 'registration' or the user cannot draw a new box.
+        self.canvas.set_mode("registration")
+
+        # Leave Register disabled while the old one still holds the GPU; its
+        # completion handler re-enables the button.
+        self.control.set_register_enabled(not reg_in_flight)
+        self.control.set_track_controls_enabled(False)
         self._status_bar.showMessage("Cleared. Draw a new bounding box to start over.")
 
     def _on_bbox_drawn(self, x1: float, y1: float, x2: float, y2: float) -> None:
@@ -1760,7 +1814,6 @@ class MainWindow(QMainWindow):
         )
         self._live_mask = None
         self._live_bbox_xywh = None
-        self._live_quad = None
         self._preview_debounce.start(400)
 
     # ------------------------------------------------------------------
@@ -1796,21 +1849,16 @@ class MainWindow(QMainWindow):
         )
         self._preview_thread.start()
 
-    def _on_mask_preview_ready(self, mask: np.ndarray, bbox_xywh: tuple, quad_pts) -> None:
+    def _on_mask_preview_ready(self, mask: np.ndarray, bbox_xywh: tuple) -> None:
         self._live_mask      = mask
         self._live_bbox_xywh = bbox_xywh
-        self._live_quad      = quad_pts   # None or (4,2) int32
-        if quad_pts is not None:
-            self.canvas.set_quad_overlay(quad_pts)
-        else:
-            self.canvas.set_mask_overlay(mask)
+        self.canvas.set_mask_overlay(mask)
         pts = self.canvas.get_prompt_points()
         n_pos = sum(1 for _, _, l in pts if l == 1)
         n_neg = sum(1 for _, _, l in pts if l == 0)
         pt_str = f"  ·  {n_pos}+ {n_neg}− pts" if pts else ""
-        quad_str = "  ·  polygon fitted" if quad_pts is not None else ""
         self._status_bar.showMessage(
-            f"Mask preview ready{pt_str}{quad_str}  ·  Click 'Register Target' to embed."
+            f"Mask preview ready{pt_str}  ·  Click 'Register Target' to embed."
         )
 
     def _on_mask_preview_error(self, msg: str) -> None:
@@ -1839,6 +1887,7 @@ class MainWindow(QMainWindow):
 
         points = self.canvas.get_prompt_points()
 
+        self._reg_cancelled = False
         self.control.register_btn.setEnabled(False)
         self.control.set_status("Loading FastSAM…")
         self._status_bar.showMessage("Registering target — please wait…")
@@ -1853,7 +1902,6 @@ class MainWindow(QMainWindow):
             separator_thresh  = self.control.get_separator_thresh(),
             precomputed_mask  = self._live_mask,
             precomputed_bbox  = self._live_bbox_xywh,
-            precomputed_quad  = self._live_quad,
             max_height        = self.control.get_max_height(),
             parent            = self,
         )
@@ -1868,26 +1916,38 @@ class MainWindow(QMainWindow):
 
     def _on_registration_error(self, msg: str) -> None:
         self.control.register_btn.setEnabled(True)
+        if self._reg_cancelled:
+            self._reg_cancelled = False
+            return
         self.control.set_status("Registration failed.")
         self._show_error(f"Registration failed:\n\n{msg}")
 
     def _on_registration_done(self, result: dict) -> None:
+        self.control.register_btn.setEnabled(True)
+
+        if self._reg_cancelled:
+            # Cleared while this registration was still running — the result
+            # describes a target the user has already thrown away.
+            self._reg_cancelled = False
+            self._status_bar.showMessage(
+                "Registration discarded. Draw a new bounding box to start over."
+            )
+            return
+
         self._reg_result = result
 
-        # Show polygon (if fitted) or raw mask overlay on canvas
-        if self._live_quad is not None:
-            self.canvas.set_quad_overlay(self._live_quad)
-        else:
-            self.canvas.set_mask_overlay(result["mask"])
+        self.canvas.set_mask_overlay(result["mask"])
         self.canvas.set_embedding_preview(result["frame_bgr"], result["bbox"])
         self.canvas.set_mode("tracking")   # disable further point-clicking
 
-        self.control.register_btn.setEnabled(True)
         self.control.set_track_controls_enabled(True)
         self.control.set_status(
             f"Registered ✓  bbox={result['bbox']}"
         )
         self._status_bar.showMessage(
+            "Target registered (FastSAM). Click 'Detect Matches' to find every "
+            "matching region in the image."
+            if self._is_image else
             "Target registered (FastSAM). Click 'Start Live Preview' to begin tracking."
         )
 
@@ -1908,8 +1968,10 @@ class MainWindow(QMainWindow):
             self._reader_thread.start_tracking(self._current_frame_idx)
 
         self.control.set_tracking_active(True)
-        self.timeline.set_playing(True)
-        self._status_bar.showMessage("Tracking…")
+        self.timeline.set_playing(not self._is_image)
+        self._status_bar.showMessage(
+            "Detecting matches…" if self._is_image else "Tracking…"
+        )
 
         # Watchdog: check GPU process health every 5 s
         self._watchdog.start(5000)
@@ -1958,12 +2020,20 @@ class MainWindow(QMainWindow):
             self._show_error("Register a target before exporting.")
             return
 
-        out_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Rendered Video", "", "MP4 Video (*.mp4);;All Files (*)"
-        )
+        if self._is_image:
+            title, filters = "Save Rendered Image", f"{IMAGE_FILTER};;All Files (*)"
+        else:
+            title, filters = "Save Rendered Video", "MP4 Video (*.mp4);;All Files (*)"
+
+        out_path, _ = QFileDialog.getSaveFileName(self, title, "", filters)
         if not out_path:
             return
-        if not out_path.lower().endswith(".mp4"):
+
+        # Force an extension the writer understands: PNG for stills, MP4 otherwise.
+        if self._is_image:
+            if not is_image_path(out_path):
+                out_path += ".png"
+        elif not out_path.lower().endswith(".mp4"):
             out_path += ".mp4"
 
         self.timeline.show_export_progress(True)
@@ -2077,7 +2147,9 @@ class MainWindow(QMainWindow):
 
     def _on_end_of_video(self) -> None:
         self.timeline.set_playing(False)
-        self._status_bar.showMessage("End of video.")
+        self._status_bar.showMessage(
+            "Image processed." if self._is_image else "End of video."
+        )
 
     def _launch_gpu_process(
         self,
@@ -2118,7 +2190,11 @@ class MainWindow(QMainWindow):
             "total_frames":    self._total_frames,
             "separator_split":  self.control.get_separator_split(),
             "separator_thresh": self.control.get_separator_thresh(),
-            "detection_mode":   self.control.get_detection_mode(),
+            # A still image has no motion and the tracker is seeded from the
+            # registration frame, so ROI mode could only re-find the object the
+            # user already outlined.  Full-frame detection is the only mode that
+            # finds the *other* matching objects.
+            "detection_mode":   self.control.get_detection_mode() or self._is_image,
             "native_w":         self._native_w,
             "native_h":         self._native_h,
         }
